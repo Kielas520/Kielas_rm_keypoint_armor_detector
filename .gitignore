@@ -209,3 +209,5 @@ __marimo__/
 data/processed/*
 data/raw/*
 extract_ros2_bag/original/*
+.python*
+*.lock
