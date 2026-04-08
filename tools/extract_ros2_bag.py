@@ -13,6 +13,7 @@ from pathlib import Path
 import multiprocessing
 import threading
 import yaml
+import numpy as np
 
 # 引入 rich 相关组件
 from rich.progress import (
@@ -24,234 +25,194 @@ from rich.progress import (
     TimeRemainingColumn,
     SpinnerColumn
 )
+from rich.console import Console
+
+console = Console()
 
 def source_env(script_path):
-    """加载 ROS2 接口环境并同步更新 Python 搜索路径"""
+    """加载 ROS2 环境"""
     script_path = Path(script_path).expanduser()
-    if not script_path.exists():
-        print(f"[跳过] 未找到环境脚本: {script_path}")
-        return
-
+    if not script_path.exists(): return
     try:
         command = f"bash -c 'source {script_path} && env'"
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True, text=True)
-
         for line in proc.stdout:
             if "=" in line:
                 key, _, value = line.partition("=")
-                value = value.strip()
-                os.environ[key] = value
-
+                os.environ[key] = value.strip()
                 if key == "PYTHONPATH":
-                    for path in value.split(":"):
-                        if path and path not in sys.path:
-                            sys.path.insert(0, path)
-
+                    for path in value.strip().split(":"):
+                        if path and path not in sys.path: sys.path.insert(0, path)
         proc.communicate()
-        print(f"[环境] 成功 Source 且已更新 sys.path")
-    except Exception as e:
-        print(f"[环境] 加载环境失败: {e}")
+    except: pass
 
 class RosBagExtractor:
     def __init__(self):
         self.folder_map = {
-            "hero_blue_data": 0,      # B1
-            "infantry_blue_data": 2,  # B3
-            "sentry_blue_data": 5,    # B7
-            "hero_red_data": 6,       # R1
-            "infantry_red_data": 8,   # R3
-            "sentry_red_data": 11     # R7
+            "hero_blue_data": 0, "infantry_blue_data": 2, "sentry_blue_data": 5,
+            "hero_red_data": 6, "infantry_red_data": 8, "sentry_red_data": 11
         }
         self.root_dir = Path(__file__).resolve().parent.parent
         self.original_dir = self.root_dir / "extract_ros2_bag" / "original"
         self.raw_data_dir = self.root_dir / "data" / "raw"
 
-    def get_msg_nanosecs(self, msg):
-        """统一从消息 Header 中提取纳秒级时间戳"""
-        return msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-
-    def prepare_directory(self, target_path: Path):
-        """检查并清理目录"""
-        try:
-            if target_path.exists():
-                shutil.rmtree(target_path)
-            target_path.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-
-    def get_reader(self, path: Path):
-        storage_options = rosbag2_py.StorageOptions(uri=str(path), storage_id='sqlite3')
-        converter_options = rosbag2_py.ConverterOptions(
-            input_serialization_format='cdr',
-            output_serialization_format='cdr')
-        reader = rosbag2_py.SequentialReader()
-        reader.open(storage_options, converter_options)
-        return reader
-
-    def process_single_bag(self, folder_name, target_id, progress_queue, task_id, diff_tol):
-        """处理单个 Bag 的核心逻辑"""
-        # 延迟导入以确保在子进程中环境正确
+    @staticmethod
+    def process_single_bag(folder_name, target_id, progress_queue, task_id, diff_tol, original_dir, raw_data_dir):
+        """自适应延迟计算与数据提取"""
+        os.environ['RCUTILS_CONSOLE_OUTPUT_FORMAT'] = ''
+        os.environ['RCL_LOG_LEVEL'] = '40' 
         from rm_interfaces.msg import ArmorsDebugMsg
         
-        bag_path = self.original_dir / folder_name
+        bag_path = original_dir / folder_name
         if not bag_path.exists():
-            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[red]未找到目录: {folder_name}"})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": "[red]目录缺失"})
             progress_queue.put({"task_id": task_id, "type": "done"})
             return
 
-        base_id_dir = self.raw_data_dir / str(target_id)
-        self.prepare_directory(base_id_dir)
+        # 准备目录
+        base_id_dir = raw_data_dir / str(target_id)
+        if base_id_dir.exists(): shutil.rmtree(base_id_dir)
+        base_id_dir.mkdir(parents=True, exist_ok=True)
+        photo_dir, label_dir = base_id_dir / "photos", base_id_dir / "labels"
+        photo_dir.mkdir(); label_dir.mkdir()
 
-        photo_dir = base_id_dir / "photos"
-        label_dir = base_id_dir / "labels"
-        photo_dir.mkdir(parents=True, exist_ok=True)
-        label_dir.mkdir(parents=True, exist_ok=True)
-
-        progress_queue.put({"task_id": task_id, "type": "description", "value": f"[cyan]建立索引: {folder_name}"})
-        
         bridge = CvBridge()
+        storage_options = rosbag2_py.StorageOptions(uri=str(bag_path), storage_id='sqlite3')
+        converter_options = rosbag2_py.ConverterOptions(input_serialization_format='cdr', output_serialization_format='cdr')
 
         try:
-            # ================= 第一步：基于 Header 时间戳预读取标签 =================
-            label_indices = []
-            reader = self.get_reader(bag_path)
+            # 1. 预分析：获取图像总数 + 自适应计算延迟
+            reader = rosbag2_py.SequentialReader()
+            reader.open(storage_options, converter_options)
             
-            storage_filter = rosbag2_py.StorageFilter(topics=['/detector/armors_debug_info'])
-            reader.set_filter(storage_filter)
+            # 获取图像总数
+            metadata = reader.get_metadata()
+            total_images = next((t.message_count for t in metadata.topics_with_message_count if t.topic_metadata.name == '/image_raw'), 0)
+            progress_queue.put({"task_id": task_id, "type": "total", "value": total_images})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": "正在计算自适应延迟..."})
+
+            # 2. 读取标签并分析延迟分布
+            label_data = []
+            latencies = []
+            reader.set_filter(rosbag2_py.StorageFilter(topics=['/detector/armors_debug_info']))
             
             while reader.has_next():
-                (_, data, _) = reader.read_next()
+                (topic, data, recv_t) = reader.read_next()
                 msg = deserialize_message(data, ArmorsDebugMsg)
+                header_t = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
                 
-                # 获取该消息对应的算法处理时间戳（与对应图像一致）
-                true_t = self.get_msg_nanosecs(msg)
+                # 计算该帧的延迟：录制时刻 - 逻辑时刻
+                # 录制时刻包含：推理时间 + 传输时间
+                latencies.append(recv_t - header_t)
                 
-                armor_list = []
-                for a in msg.armors_debug:
-                    armor_list.append({
-                        'id': a.armor_id, 'color': a.color,
-                        'pts': [a.l_light_up_dx, a.l_light_up_dy, a.l_light_down_dx, a.l_light_down_dy,
-                                a.r_light_up_dx, a.r_light_up_dy, a.r_light_down_dx, a.r_light_down_dy]
-                    })
-                label_indices.append((true_t, armor_list))
+                armors = [{'id': a.armor_id, 'color': a.color, 'pts': [a.l_light_up_dx, a.l_light_up_dy, a.l_light_down_dx, a.l_light_down_dy, a.r_light_up_dx, a.r_light_up_dy, a.r_light_down_dx, a.r_light_down_dy]} for a in msg.armors_debug]
+                label_data.append({"header_t": header_t, "armors": armors})
 
-            if not label_indices:
-                progress_queue.put({"task_id": task_id, "type": "description", "value": f"[yellow]无标签数据: {folder_name}"})
+            if not label_data:
+                progress_queue.put({"task_id": task_id, "type": "description", "value": "[yellow]无标签消息"})
                 progress_queue.put({"task_id": task_id, "type": "done"})
                 return
 
-            # 按 Header 时间戳排序确保二分查找准确
-            label_indices.sort(key=lambda x: x[0])
-            label_timestamps = [x[0] for x in label_indices]
-
-            expected_total = len(label_timestamps)
-            progress_queue.put({"task_id": task_id, "type": "total", "value": expected_total})
-            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[blue]同步保存中: {folder_name}"})
-
-            # ================= 第二步：基于 Header 时间戳同步图像 =================
-            reader = self.get_reader(bag_path)
-            image_filter = rosbag2_py.StorageFilter(topics=['/image_raw'])
-            reader.set_filter(image_filter)
+            # 使用中位数平滑掉系统抖动产生的延迟偏移
+            adaptive_latency_ns = int(np.median(latencies))
+            # 注意：如果算出来是负数，说明录制时刻不可信，或者 header 有问题，回退到 0
+            adaptive_latency_ns = max(0, adaptive_latency_ns)
             
-            img_count = 0
-            update_batch = 0
+            # 补偿后的标签时间戳序列（尝试对应回图像曝光时间）
+            comp_label_ts = [x["header_t"] - adaptive_latency_ns for x in label_data]
             
+            desc_info = f"延迟: {adaptive_latency_ns/1e6:.1f}ms"
+            progress_queue.put({"task_id": task_id, "type": "description", "value": f"{desc_info} | 导出中..."})
+
+            # 3. 匹配图像
+            reader = rosbag2_py.SequentialReader()
+            reader.open(storage_options, converter_options)
+            reader.set_filter(rosbag2_py.StorageFilter(topics=['/image_raw']))
+            
+            img_count, batch = 0, 0
             while reader.has_next():
                 (_, data, _) = reader.read_next()
                 msg = deserialize_message(data, Image)
+                img_t = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
                 
-                # 获取图像真实的物理曝光/发布时间戳
-                img_true_t = self.get_msg_nanosecs(msg)
-                
-                # 二分法寻找最接近的标签时间戳
-                idx = bisect.bisect_left(label_timestamps, img_true_t)
-                best_idx = idx
-                if idx > 0 and (idx == len(label_timestamps) or abs(img_true_t - label_timestamps[idx-1]) < abs(img_true_t - label_timestamps[idx])):
-                    best_idx = idx - 1
+                # 寻找最接近补偿后标签的图像
+                idx = bisect.bisect_left(comp_label_ts, img_t)
+                best_idx = -1
+                min_diff = float('inf')
+                for i in [idx-1, idx]:
+                    if 0 <= i < len(comp_label_ts):
+                        diff = abs(img_t - comp_label_ts[i])
+                        if diff < min_diff: min_diff, best_idx = diff, i
 
-                # 阈值判断：如果图像和最近的标签时间差超过 20ms，视为不匹配（针对 RM 100FPS+ 场景）
-                diff_ns = abs(img_true_t - label_timestamps[best_idx])
-                if diff_ns < diff_tol:
+                if best_idx != -1 and min_diff < diff_tol:
                     cv_img = bridge.imgmsg_to_cv2(msg, "bgr8")
-                    file_name = f"{img_count:06d}"
-                    
-                    # 导出图像与标签
-                    cv2.imwrite(str(photo_dir / f"{file_name}.jpg"), cv_img)
-                    matched_armors = label_indices[best_idx][1]
-                    with open(label_dir / f"{file_name}.txt", 'w') as f:
-                        for a in matched_armors:
-                            pts_str = " ".join(map(str, a['pts']))
-                            f.write(f"{a['id']} {a['color']} {pts_str}\n")
-
+                    name = f"{img_count:06d}"
+                    cv2.imwrite(str(photo_dir / f"{name}.jpg"), cv_img)
+                    with open(label_dir / f"{name}.txt", 'w') as f:
+                        for a in label_data[best_idx]["armors"]:
+                            f.write(f"{a['id']} {a['color']} {' '.join(map(str, a['pts']))}\n")
                     img_count += 1
-                    update_batch += 1
-                    
-                    if update_batch >= 10:
-                        progress_queue.put({"task_id": task_id, "type": "advance", "value": update_batch})
-                        update_batch = 0
+                
+                batch += 1
+                if batch >= 20:
+                    progress_queue.put({"task_id": task_id, "type": "advance", "value": batch})
+                    batch = 0
 
-            if update_batch > 0:
-                progress_queue.put({"task_id": task_id, "type": "advance", "value": update_batch})
-
-            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[green]已完成 {folder_name} (匹配{img_count}组)"})
+            progress_queue.put({"task_id": task_id, "type": "advance", "value": batch})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[green]完成 ({img_count}帧)"})
             progress_queue.put({"task_id": task_id, "type": "done"})
-
         except Exception as e:
             progress_queue.put({"task_id": task_id, "type": "description", "value": f"[red]异常: {str(e)[:20]}"})
             progress_queue.put({"task_id": task_id, "type": "done"})
 
     def extract(self, diff_tol):
-        print(f"准备并发处理 {len(self.folder_map)} 个数据包...")
+        console.print(f"[bold blue]ROS2 数据自适应对齐提取器[/bold blue]")
         manager = multiprocessing.Manager()
         progress_queue = manager.Queue()
 
         progress = Progress(
             SpinnerColumn(),
-            TextColumn("[bold width=30]{task.description}"),
-            BarColumn(bar_width=40),
+            TextColumn("[bold blue]{task.fields[name]}"),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=30),
             TaskProgressColumn(),
-            TimeElapsedColumn(),
-            TextColumn("•"),
             TimeRemainingColumn(),
+            refresh_per_second=5
         )
 
-        def update_progress_thread():
+        def update_ui():
             while True:
                 msg = progress_queue.get()
                 if msg is None: break
-                task_id = msg['task_id']
-                if msg['type'] == 'total': progress.update(task_id, total=msg['value'])
-                elif msg['type'] == 'advance': progress.advance(task_id, advance=msg['value'])
-                elif msg['type'] == 'description': progress.update(task_id, description=msg['value'])
-                elif msg['type'] == 'done':
-                    current_task = progress.tasks[task_id]
-                    progress.update(task_id, completed=current_task.total or 100)
+                tid = msg['task_id']
+                if msg['type'] == 'total': progress.update(tid, total=msg['value'])
+                elif msg['type'] == 'advance': progress.advance(tid, advance=msg['value'])
+                elif msg['type'] == 'description': progress.update(tid, description=msg['value'])
+                elif msg['type'] == 'done': progress.update(tid, completed=progress.tasks[tid].total or 1)
 
         with progress:
-            tasks = {name: progress.add_task(f"[cyan]等待中: {name}", total=None) for name in self.folder_map.keys()}
-            listener = threading.Thread(target=update_progress_thread)
-            listener.start()
+            task_ids = {name: progress.add_task("初始化...", name=f"{name:<20}", total=None) for name in self.folder_map.keys()}
+            ui_thread = threading.Thread(target=update_ui, daemon=True); ui_thread.start()
 
+            # 使用进程池，注意 max_workers 根据 CPU 核心调整
             with ProcessPoolExecutor(max_workers=6) as executor:
-                futures = [executor.submit(self.process_single_bag, name, tid, progress_queue, tasks[name], diff_tol) 
-                          for name, tid in self.folder_map.items()]
+                futures = [executor.submit(self.process_single_bag, n, tid, progress_queue, task_ids[n], diff_tol, self.original_dir, self.raw_data_dir) for n, tid in self.folder_map.items()]
                 for f in futures: f.result()
 
-            progress_queue.put(None)
-            listener.join()
+            progress_queue.put(None); ui_thread.join()
 
 if __name__ == '__main__':
     source_path = "~/DT46_V/install/setup.bash"
     config_path = "config.yaml"
-    if not Path(config_path).exists():
-        print(f"❌ 找不到配置文件 {config_path}")
-    else:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-            diff_tol  = config.get("diff_tol_ns", 20_000_000)
-        if "DT46_V" not in os.environ.get("LD_LIBRARY_PATH", ""):
-            source_env(source_path)
-            os.execv(sys.executable, ['python3'] + sys.argv)
+    diff_tol = 15_000_000 # 容差设为 15ms，匹配更严格一点
 
-        extractor = RosBagExtractor()
-        extractor.extract(diff_tol)
+    if Path(config_path).exists():
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+            diff_tol = cfg.get("diff_tol_ns", diff_tol)
+
+    if "DT46_V" not in os.environ.get("LD_LIBRARY_PATH", ""):
+        source_env(source_path)
+        os.execv(sys.executable, ['python3'] + sys.argv)
+
+    RosBagExtractor().extract(diff_tol)
