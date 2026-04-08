@@ -1,5 +1,7 @@
 import random
 import cv2
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
 import matplotlib.pyplot as plt
 from pathlib import Path
 
@@ -97,7 +99,8 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_color = True)
             ax.axis('off')
 
     plt.tight_layout()
-    plt.show()
+    plt.savefig("dataset_visualization.png")
+    print("可视化结果已保存至 dataset_visualization.png")
 
 # 调用示例
 visualize_dataset("./data", "raw", True)

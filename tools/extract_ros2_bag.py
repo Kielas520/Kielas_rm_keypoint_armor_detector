@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 import multiprocessing
 import threading
+import yaml
 
 # 引入 rich 相关组件
 from rich.progress import (
@@ -87,7 +88,7 @@ class RosBagExtractor:
         reader.open(storage_options, converter_options)
         return reader
 
-    def process_single_bag(self, folder_name, target_id, progress_queue, task_id):
+    def process_single_bag(self, folder_name, target_id, progress_queue, task_id, diff_tol):
         """处理单个 Bag 的核心逻辑"""
         # 延迟导入以确保在子进程中环境正确
         from rm_interfaces.msg import ArmorsDebugMsg
@@ -170,7 +171,7 @@ class RosBagExtractor:
 
                 # 阈值判断：如果图像和最近的标签时间差超过 20ms，视为不匹配（针对 RM 100FPS+ 场景）
                 diff_ns = abs(img_true_t - label_timestamps[best_idx])
-                if diff_ns < 20_000_000:
+                if diff_ns < diff_tol:
                     cv_img = bridge.imgmsg_to_cv2(msg, "bgr8")
                     file_name = f"{img_count:06d}"
                     
@@ -199,7 +200,7 @@ class RosBagExtractor:
             progress_queue.put({"task_id": task_id, "type": "description", "value": f"[red]异常: {str(e)[:20]}"})
             progress_queue.put({"task_id": task_id, "type": "done"})
 
-    def extract(self):
+    def extract(self, diff_tol):
         print(f"准备并发处理 {len(self.folder_map)} 个数据包...")
         manager = multiprocessing.Manager()
         progress_queue = manager.Queue()
@@ -232,7 +233,7 @@ class RosBagExtractor:
             listener.start()
 
             with ProcessPoolExecutor(max_workers=6) as executor:
-                futures = [executor.submit(self.process_single_bag, name, tid, progress_queue, tasks[name]) 
+                futures = [executor.submit(self.process_single_bag, name, tid, progress_queue, tasks[name], diff_tol) 
                           for name, tid in self.folder_map.items()]
                 for f in futures: f.result()
 
@@ -241,10 +242,16 @@ class RosBagExtractor:
 
 if __name__ == '__main__':
     source_path = "~/DT46_V/install/setup.bash"
+    config_path = "config.yaml"
+    if not Path(config_path).exists():
+        print(f"❌ 找不到配置文件 {config_path}")
+    else:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+            diff_tol  = config.get("diff_tol_ns", 20_000_000)
+        if "DT46_V" not in os.environ.get("LD_LIBRARY_PATH", ""):
+            source_env(source_path)
+            os.execv(sys.executable, ['python3'] + sys.argv)
 
-    if "DT46_V" not in os.environ.get("LD_LIBRARY_PATH", ""):
-        source_env(source_path)
-        os.execv(sys.executable, ['python3'] + sys.argv)
-
-    extractor = RosBagExtractor()
-    extractor.extract()
+        extractor = RosBagExtractor()
+        extractor.extract(diff_tol)
