@@ -206,7 +206,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-data/*
+data/
 extract_ros2_bag/original/*
 .python*
 *.lock
