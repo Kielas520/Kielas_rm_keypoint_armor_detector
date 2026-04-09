@@ -7,10 +7,9 @@ import copy
 from pathlib import Path
 from queue import Queue
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, List
 import yaml
 
-# 引入 rich 组件
 from rich.console import Console
 from rich.progress import (
     Progress, SpinnerColumn, TextColumn, BarColumn, 
@@ -25,35 +24,58 @@ console = Console()
 @dataclass
 class AugmentConfig:
     """图像增强配置参数类"""
+    # 基础与光学
     brightness_prob: float = 0.8
     brightness_range: Tuple[float, float] = (0.6, 1.4)
+    blur_prob: float = 0.3
+    blur_ksize: List[int] = None
+    hsv_prob: float = 0.5
+    hsv_h_gain: float = 0.015
+    hsv_s_gain: float = 0.4
+    hsv_v_gain: float = 0.4
+    noise_prob: float = 0.3
+    bloom_prob: float = 0.3
+
+    # 几何变换
     flip_prob: float = 0.5
     scale_prob: float = 0.5
     scale_range: Tuple[float, float] = (0.8, 1.2)
     rotate_prob: float = 0.5
     rotate_range: Tuple[float, float] = (-15, 15)
+    translate_prob: float = 0.4
+    translate_range: float = 0.1
+    perspective_prob: float = 0.3
+    perspective_factor: float = 0.08
+    
+    # 背景替换 (新增)
+    bg_replace_prob: float = 0.3          # 触发概率
+    bg_dir: str = "./background"          # 背景图文件夹路径
+    bg_radius_factor: float = 1.3         # 约束圆半径放大系数 (1.0表示刚好包住最远角点)
+    bg_blur_ksize: int = 31               # 掩膜边缘平滑度(必须是奇数)
+
+    # 遮挡
     occ_prob: float = 0.5
     occ_radius_pct: float = 0.2
     occ_size_pct: Tuple[float, float] = (0.05, 0.15)
     vis_heavy_threshold: float = 0.7
     vis_part_threshold: float = 0.1
 
+    def __post_init__(self):
+        if self.blur_ksize is None:
+            self.blur_ksize = [3, 5, 7]
+
     @staticmethod
     def from_yaml(yaml_path: str):
-        """从 yaml 配置文件加载参数"""
         cfg = AugmentConfig()
         try:
             with open(yaml_path, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f)
-                # 定位到 config.yaml 中的 augment 层级
-                aug_data = data.get('kielas_rm_model', {}).get('dataset', {}).get('augment', {})
+                aug_data = data.get('kielas_rm_train', {}).get('dataset', {}).get('augment', {})
                 
                 if aug_data:
-                    # 遍历 yaml 中的键值对，如果匹配则更新
                     for key, value in aug_data.items():
                         if hasattr(cfg, key):
-                            # 处理元组类型 (yaml 读入通常是 list)
-                            if isinstance(value, list) and len(value) == 2:
+                            if isinstance(value, list) and len(value) == 2 and key != 'blur_ksize':
                                 value = tuple(value)
                             setattr(cfg, key, value)
                     console.print(f"[green]已从 {yaml_path} 加载增强配置[/green]")
@@ -64,21 +86,17 @@ class AugmentConfig:
         return cfg
 
 class MofNCompleteColumn(ProgressColumn):
-    """自定义列显示 n/m 格式"""
     def render(self, task):
         completed = int(task.completed)
         total = int(task.total) if task.total is not None else "?"
         return Text(f"{completed}/{total}", style="progress.remaining")
 
-
 def parse_labels(label_lines, filename=""):
-    """解析标签，向下兼容 9个值 和 10个值"""
     parsed = []
     for line in label_lines:
         clean_line = line.replace(',', ' ').strip()
         parts = clean_line.split()
-        if not parts or len(parts) < 9:
-            continue
+        if not parts or len(parts) < 9: continue
         class_id = parts[0]
         try:
             if len(parts) == 9:
@@ -92,9 +110,7 @@ def parse_labels(label_lines, filename=""):
             continue
     return parsed
 
-
 def format_labels(labels):
-    """将结构化标签转回字符串列表"""
     new_lines = []
     for lab in labels:
         pts_flat = lab['pts'].flatten()
@@ -102,53 +118,74 @@ def format_labels(labels):
         new_lines.append(f"{lab['class_id']} {lab['vis']} {coords_str}")
     return new_lines
 
-
-def process_data(img, labels, cfg: AugmentConfig):
-    """同步处理图像与标签增强"""
+def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
     aug_img = img.copy()
     aug_labels = copy.deepcopy(labels)
     h, w = aug_img.shape[:2]
         
-    # 1. 亮度调整
+    # ================= 1. 光学与色彩空间变换 =================
+    
     if random.random() < cfg.brightness_prob:
         factor = random.uniform(*cfg.brightness_range)
         aug_img = np.clip(aug_img.astype(np.float32) * factor, 0, 255).astype(np.uint8)
-    
-    # 1.5 水平翻转 (针对装甲板四角点排序优化)
-    if random.random() < cfg.flip_prob:
-        aug_img = cv2.flip(aug_img, 1)  # 1 表示水平翻转
-        for lab in aug_labels:
-            # 1. 翻转所有坐标点的 x 值：新 x = 图像宽度 - 原 x
-            lab['pts'][:, 0] = w - lab['pts'][:, 0]
-            
-            # 2. 重新排序点位以符合定义:
-            # 原顺序: [0:左下, 1:左上, 2:右下, 3:右上]
-            # 翻转后: 原左下变为右下，原左上变为右上，以此类推
-            # 因此需要执行交换：(左下 <-> 右下), (左上 <-> 右上)
-            
-            # 暂存翻转后的点数据
-            old_pts = lab['pts'].copy()
-            
-            # 执行索引交换
-            lab['pts'][0] = old_pts[2]  # 新左下 = 旧右下
-            lab['pts'][1] = old_pts[3]  # 新左上 = 旧右上
-            lab['pts'][2] = old_pts[0]  # 新右下 = 旧左下
-            lab['pts'][3] = old_pts[1]  # 新右上 = 旧左上
 
-    # 2. 随机 Resize 
+    if random.random() < cfg.blur_prob:
+        ksize = random.choice(cfg.blur_ksize)
+        angle = random.uniform(0, 180)
+        M_blur = cv2.getRotationMatrix2D((ksize/2, ksize/2), angle, 1)
+        kernel = np.zeros((ksize, ksize))
+        kernel[int((ksize-1)/2), :] = np.ones(ksize)
+        kernel = cv2.warpAffine(kernel, M_blur, (ksize, ksize))
+        kernel = kernel / ksize
+        aug_img = cv2.filter2D(aug_img, -1, kernel)
+
+    if random.random() < cfg.hsv_prob:
+        hsv = cv2.cvtColor(aug_img, cv2.COLOR_BGR2HSV).astype(np.float32)
+        h_gain = random.uniform(-cfg.hsv_h_gain, cfg.hsv_h_gain) * 180
+        s_gain = random.uniform(-cfg.hsv_s_gain, cfg.hsv_s_gain)
+        v_gain = random.uniform(-cfg.hsv_v_gain, cfg.hsv_v_gain)
+        hsv[:, :, 0] = (hsv[:, :, 0] + h_gain) % 180
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1 + s_gain), 0, 255)
+        hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1 + v_gain), 0, 255)
+        aug_img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    if random.random() < cfg.noise_prob:
+        noise = np.random.normal(0, 15, aug_img.shape).astype(np.float32)
+        aug_img = np.clip(aug_img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    if aug_labels and random.random() < cfg.bloom_prob:
+        bloom_layer = np.zeros_like(aug_img, dtype=np.float32)
+        for lab in aug_labels:
+            if random.random() < 0.5: 
+                center = np.mean(lab['pts'], axis=0).astype(int)
+                cv2.circle(bloom_layer, tuple(center), int(min(h, w) * 0.05), (255, 255, 255), -1)
+        bloom_layer = cv2.GaussianBlur(bloom_layer, (0, 0), sigmaX=15)
+        aug_img = np.clip(aug_img.astype(np.float32) + bloom_layer, 0, 255).astype(np.uint8)
+
+    # ================= 2. 高级几何变换 =================
+
+    if random.random() < cfg.flip_prob:
+        aug_img = cv2.flip(aug_img, 1)
+        for lab in aug_labels:
+            lab['pts'][:, 0] = w - lab['pts'][:, 0]
+            old_pts = lab['pts'].copy()
+            lab['pts'][0] = old_pts[3]  
+            lab['pts'][1] = old_pts[2]  
+            lab['pts'][2] = old_pts[1]  
+            lab['pts'][3] = old_pts[0]  
+
     if random.random() < cfg.scale_prob:
         scale = random.uniform(*cfg.scale_range)
         aug_img = cv2.resize(aug_img, None, fx=scale, fy=scale)
         for lab in aug_labels:
             lab['pts'] = lab['pts'] * scale
-        h, w = aug_img.shape[:2] # 更新当前尺寸
+        h, w = aug_img.shape[:2]
             
-    # 3. 旋转处理
     if random.random() < cfg.rotate_prob:
         angle = random.uniform(*cfg.rotate_range)
         center = (w / 2, h / 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        aug_img = cv2.warpAffine(aug_img, M, (w, h))
+        M_rot = cv2.getRotationMatrix2D(center, angle, 1.0)
+        aug_img = cv2.warpAffine(aug_img, M_rot, (w, h))
         
         theta = np.radians(-angle) 
         cos_t, sin_t = np.cos(theta), np.sin(theta)
@@ -159,7 +196,69 @@ def process_data(img, labels, cfg: AugmentConfig):
             rotated_pts[:, 1] = pts[:, 0] * sin_t + pts[:, 1] * cos_t
             lab['pts'] = rotated_pts + np.array(center)
 
-    # 4. 围绕目标的随机遮挡 (Cutout)
+    if random.random() < cfg.translate_prob:
+        tx = random.uniform(-cfg.translate_range, cfg.translate_range) * w
+        ty = random.uniform(-cfg.translate_range, cfg.translate_range) * h
+        M_trans = np.float32([[1, 0, tx], [0, 1, ty]])
+        aug_img = cv2.warpAffine(aug_img, M_trans, (w, h), borderValue=(0,0,0))
+        for lab in aug_labels:
+            lab['pts'][:, 0] += tx
+            lab['pts'][:, 1] += ty
+
+    if random.random() < cfg.perspective_prob:
+        margin = min(h, w) * cfg.perspective_factor
+        pts1 = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
+        pts2 = np.float32([
+            [random.uniform(-margin, margin), random.uniform(-margin, margin)],
+            [w + random.uniform(-margin, margin), random.uniform(-margin, margin)],
+            [random.uniform(-margin, margin), h + random.uniform(-margin, margin)],
+            [w + random.uniform(-margin, margin), h + random.uniform(-margin, margin)]
+        ])
+        M_persp = cv2.getPerspectiveTransform(pts1, pts2)
+        aug_img = cv2.warpPerspective(aug_img, M_persp, (w, h), borderValue=(0,0,0))
+        
+        for lab in aug_labels:
+            pts_reshaped = np.array([lab['pts']], dtype=np.float32)
+            lab['pts'] = cv2.perspectiveTransform(pts_reshaped, M_persp)[0]
+
+    # ================= 3. 边界检查与可见度修正 =================
+    for lab in aug_labels:
+        out_count = sum(1 for pt in lab['pts'] if pt[0] < 0 or pt[0] >= w or pt[1] < 0 or pt[1] >= h)
+        
+        if out_count >= 3:  
+            lab['vis'] = 0
+        elif out_count > 0: 
+            lab['vis'] = min(lab['vis'], 1)
+            
+        center_x, center_y = np.mean(lab['pts'], axis=0)
+        if center_x < 0 or center_x >= w or center_y < 0 or center_y >= h:
+            lab['vis'] = 0
+
+    # ================= 4. 随机背景替换 (约束圆掩膜) =================
+    if aug_labels and bg_paths and random.random() < cfg.bg_replace_prob:
+        bg_path = random.choice(bg_paths)
+        bg_img = cv2.imread(str(bg_path))
+        
+        if bg_img is not None:
+            bg_img = cv2.resize(bg_img, (w, h))
+            mask = np.zeros((h, w), dtype=np.float32)
+            
+            for lab in aug_labels:
+                if lab['vis'] > 0:
+                    pts = lab['pts']
+                    center = np.mean(pts, axis=0)
+                    distances = np.linalg.norm(pts - center, axis=1)
+                    base_radius = np.max(distances)
+                    radius = int(base_radius * cfg.bg_radius_factor)
+                    cv2.circle(mask, (int(center[0]), int(center[1])), radius, 1.0, -1)
+            
+            if cfg.bg_blur_ksize > 0:
+                mask = cv2.GaussianBlur(mask, (cfg.bg_blur_ksize, cfg.bg_blur_ksize), 0)
+            
+            mask_3d = np.expand_dims(mask, axis=-1)
+            aug_img = (aug_img.astype(np.float32) * mask_3d + bg_img.astype(np.float32) * (1 - mask_3d)).astype(np.uint8)
+
+    # ================= 5. 随机遮挡 (Cutout) =================
     if aug_labels and random.random() < cfg.occ_prob:
         radius = (w * cfg.occ_radius_pct) / 2.0
         occ_boxes = []
@@ -185,14 +284,12 @@ def process_data(img, labels, cfg: AugmentConfig):
         
         if occ_boxes:
             for lab in aug_labels:
-                # 基于点的遮挡辅助判断
                 covered_points = 0
                 for pt in lab['pts']:
                     px, py = pt[0], pt[1]
                     if any(x1 <= px <= x2 and y1 <= py <= y2 for x1, y1, x2, y2 in occ_boxes):
                         covered_points += 1
 
-                # 基于面积的遮挡判断
                 pts = lab['pts']
                 min_x, min_y = np.min(pts, axis=0)
                 max_x, max_y = np.max(pts, axis=0)
@@ -219,9 +316,7 @@ def process_data(img, labels, cfg: AugmentConfig):
         
     return aug_img, aug_labels
 
-
-def augment_worker(task_queue: Queue, progress: Progress, task_id, cfg: AugmentConfig):
-    """后台线程：执行增强处理任务"""
+def augment_worker(task_queue: Queue, progress: Progress, task_id, cfg: AugmentConfig, bg_paths: list):
     while True:
         task = task_queue.get()
         if task is None: break
@@ -238,7 +333,7 @@ def augment_worker(task_queue: Queue, progress: Progress, task_id, cfg: AugmentC
                 task_queue.task_done()
                 continue
                 
-            aug_img, aug_labels = process_data(img, parsed_labels, cfg)
+            aug_img, aug_labels = process_data(img, parsed_labels, cfg, bg_paths)
             cv2.imwrite(str(out_img_path), aug_img)
             
             new_label_lines = format_labels(aug_labels)
@@ -250,9 +345,7 @@ def augment_worker(task_queue: Queue, progress: Progress, task_id, cfg: AugmentC
         progress.advance(task_id)
         task_queue.task_done()
 
-
 def generate_yaml(output_dir: Path):
-    """生成 train.yaml 配置文件"""
     yaml_path = output_dir / "train.yaml"
     class_counts = {}
     for class_dir in output_dir.iterdir():
@@ -270,7 +363,6 @@ def generate_yaml(output_dir: Path):
     content += "\nweights:\n"
     for cid in sorted_cids: content += f"  {cid}: {class_weights[cid]:.4f}\n"
     with open(yaml_path, 'w', encoding='utf-8') as f: f.write(content)
-
 
 def run_augment_pipeline(input_dir: str, output_dir: str, num_workers: int = 8, cfg: AugmentConfig = None):
     if cfg is None: cfg = AugmentConfig()
@@ -296,16 +388,25 @@ def run_augment_pipeline(input_dir: str, output_dir: str, num_workers: int = 8, 
     if out_path.exists(): shutil.rmtree(out_path)
     out_path.mkdir(parents=True, exist_ok=True)
 
+    bg_paths = []
+    bg_dir = Path(cfg.bg_dir)
+    if bg_dir.exists():
+        bg_paths = list(bg_dir.glob("*.jpg")) + list(bg_dir.glob("*.png")) + list(bg_dir.glob("*.jpeg"))
+        if bg_paths:
+            console.print(f"[green]已加载 {len(bg_paths)} 张背景图片用于替换增强[/green]")
+        else:
+            console.print("[yellow]背景文件夹为空，将跳过背景替换增强[/yellow]")
+    else:
+        console.print(f"[yellow]未找到背景文件夹 {cfg.bg_dir}，将跳过背景替换增强[/yellow]")
+
     # 打印配置信息
-    table = Table(title="数据增强流水线", header_style="bold cyan")
-    table.add_column("配置项")
-    table.add_column("当前值")
-    table.add_row("输入/输出", f"{input_dir} -> {output_dir}")
-    table.add_row("并行线程数", str(num_workers))
-    table.add_row("亮度范围", f"{cfg.brightness_range} (概率:{cfg.brightness_prob})")
-    table.add_row("水平翻转概率", f"{cfg.flip_prob}") 
-    table.add_row("旋转角度", f"{cfg.rotate_range}")
-    table.add_row("遮挡半径占比", f"{cfg.occ_radius_pct}")
+    table = Table(title="数据增强", header_style="bold cyan")
+    table.add_column("模块")
+    table.add_column("配置与状态")
+    table.add_row("基础架构", f"输入:{input_dir} | 输出:{output_dir} | 线程:{num_workers}")
+    table.add_row("光学增强", f"模糊:{cfg.blur_prob} | HSV抖动:{cfg.hsv_prob} | 噪声:{cfg.noise_prob} | 光晕:{cfg.bloom_prob}")
+    table.add_row("几何变换", f"平移:{cfg.translate_prob} | 缩放:{cfg.scale_prob} | 翻转:{cfg.flip_prob} | 透视:{cfg.perspective_prob}")
+    table.add_row("高级遮挡", f"背景替换:{cfg.bg_replace_prob} (半径倍数:{cfg.bg_radius_factor}) | 随机遮挡:{cfg.occ_prob}")
     console.print(table)
 
     progress = Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
@@ -315,7 +416,8 @@ def run_augment_pipeline(input_dir: str, output_dir: str, num_workers: int = 8, 
     with progress:
         main_task = progress.add_task("[magenta]执行增强处理...", total=len(tasks))
         task_queue = Queue(maxsize=2000)
-        threads = [threading.Thread(target=augment_worker, args=(task_queue, progress, main_task, cfg), daemon=True) 
+        
+        threads = [threading.Thread(target=augment_worker, args=(task_queue, progress, main_task, cfg, bg_paths), daemon=True) 
                    for _ in range(num_workers)]
         for t in threads: t.start()
 
@@ -334,11 +436,9 @@ def run_augment_pipeline(input_dir: str, output_dir: str, num_workers: int = 8, 
     console.print(Panel(f"✅ 处理完成！总数: {len(tasks)}", border_style="green", title="Success"))
 
 if __name__ == "__main__":
-    # 1. 从 YAML 加载配置
     config_path = "config.yaml"
     config = AugmentConfig.from_yaml(config_path)
 
-    # 2. 执行流水线
     run_augment_pipeline(
         input_dir="./data/balance", 
         output_dir="./data/augment", 
