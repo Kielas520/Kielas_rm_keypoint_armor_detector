@@ -85,6 +85,17 @@ def purify_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: f
         console.print(f"[bold red]错误：[/bold red]找不到原始目录 {raw_path}")
         return
 
+    # ==========================================
+    # 新增：检测并刷新输出文件夹
+    # ==========================================
+    if out_path.exists():
+        console.print(f"[yellow]检测到输出目录已存在，正在清理旧数据: {out_path}[/yellow]")
+        shutil.rmtree(out_path)
+    
+    # 重新创建干净的输出主目录
+    out_path.mkdir(parents=True, exist_ok=True)
+    # ==========================================
+
     # 1. 预扫描
     valid_class_dirs = []
     total_files = 0
@@ -120,7 +131,7 @@ def purify_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: f
         "distance_skipped": 0, 
         "format_error": 0, 
         "missing_photo": 0, 
-        "empty_label": 0,  # 新增：空标签统计
+        "empty_label": 0, 
         "saved": 0
     }
     io_queue = Queue(maxsize=1000)
@@ -165,9 +176,7 @@ def purify_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: f
                 with open(label_file, 'r', encoding='utf-8') as f:
                     lines = f.readlines()
 
-                # ==========================================
-                # 修改点：拦截全空文件或只包含空白符的文件
-                # ==========================================
+                # 拦截全空文件或只包含空白符的文件
                 if not lines or all(line.strip() == '' for line in lines):
                     stats["empty_label"] += 1
                     progress.advance(main_task)
@@ -175,9 +184,6 @@ def purify_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: f
 
                 current_center, status = get_frame_center(lines, expected_class_id)
 
-                # ==========================================
-                # 修改点：明确拦截解析结果为 EMPTY 的情况
-                # ==========================================
                 if status == "EMPTY":
                     stats["empty_label"] += 1
                     progress.advance(main_task)
