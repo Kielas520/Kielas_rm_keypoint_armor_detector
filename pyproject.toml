@@ -10,5 +10,6 @@ dependencies = [
     "numpy<2.0.0",
     "opencv-python<4.11",  # 限制版本以兼容 NumPy 1.x
     "rich>=14.3.3",
-    "PyYAML"
+    "PyYAML",
+    "requests>=2.33.1",
 ]
