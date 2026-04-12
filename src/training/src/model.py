@@ -39,13 +39,18 @@ class RMHead(nn.Module):
     # ... [保持你原来的代码] ...
     def __init__(self, in_channels=256):
         super().__init__()
+        # 拆分为置信度头和关键点头
+        # 原有的 1个 Conf + 4个 Box，正好是 5 个通道
         self.box_head = nn.Conv2d(in_channels, 5, kernel_size=1, stride=1)
         self.pose_head = nn.Conv2d(in_channels, 8, kernel_size=1, stride=1)
+        self.cls_head = nn.Conv2d(in_channels, 12, kernel_size=1, stride=1) # 12 类
 
     def forward(self, x):
         box_out = self.box_head(x)   
-        pose_out = self.pose_head(x) 
-        out = torch.cat([box_out, pose_out], dim=1)
+        pose_out = self.pose_head(x)
+        cls_out = self.cls_head(x)
+        # 拼接后总通道数为 5 + 8 + 12 = 25
+        out = torch.cat([box_out, pose_out, cls_out], dim=1)
         return out
 
 class RMBackbone(nn.Module):
@@ -129,15 +134,11 @@ class RMDetector(nn.Module):
 
 # 新增：核心解码工具函数 (供推断与可视化使用)
 
-def decode_tensor(tensor, is_pred=True, conf_threshold=0.5, nms_iou_threshold=0.45, grid_size=(52, 52), img_size=(416, 416)):
-    """
-    将网格张量解码为像素坐标，并执行全局 NMS 后处理
-    """
+def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, nms_iou_threshold=0.45, grid_size=(52, 52), img_size=(416, 416)):
     batch_size = tensor.shape[0]
     grid_w, grid_h = grid_size
     img_w, img_h = img_size
     
-    # 1. 只有预测值需要 Sigmoid，真实标签已经是 0 或 1
     if is_pred:
         conf = torch.sigmoid(tensor[:, 0, :, :])
     else:
@@ -154,6 +155,19 @@ def decode_tensor(tensor, is_pred=True, conf_threshold=0.5, nms_iou_threshold=0.
         grid_y, grid_x = torch.nonzero(mask, as_tuple=True)
         scores = conf[b, grid_y, grid_x]
         
+        # --- 新增：解析 class_id ---
+        if is_pred:
+            # 取 13:25 通道计算预测类别
+            cls_logits = tensor[b, 13:25, grid_y, grid_x].T
+            classes = torch.argmax(cls_logits, dim=1).float()
+        else:
+            # 从外部传入的 class_tensor 获取真实类别
+            if class_tensor is not None:
+                classes = class_tensor[b, 0, grid_y, grid_x].float()
+            else:
+                classes = torch.zeros_like(scores)
+        # ---------------------------
+        
         raw_pose = tensor[b, 5:13, grid_y, grid_x].T  
         decoded_pose = torch.zeros_like(raw_pose)
         
@@ -167,25 +181,19 @@ def decode_tensor(tensor, is_pred=True, conf_threshold=0.5, nms_iou_threshold=0.
             decoded_pose[:, i*2] = px_norm * img_w
             decoded_pose[:, i*2 + 1] = py_norm * img_h
             
-        # ==========================================
-        # 修复：把 NMS 提出来，让 Pred 和 GT 都执行 NMS 过滤
-        # ==========================================
-        
-        # 计算 4 个关键点的最小外接矩形 [N, 4] -> (x1, y1, x2, y2)
         pts = decoded_pose.view(-1, 4, 2)
         min_xy, _ = torch.min(pts, dim=1) 
         max_xy, _ = torch.max(pts, dim=1) 
         boxes_for_nms = torch.cat([min_xy, max_xy], dim=1)
         
-        # 执行 NMS
         keep_idx = torchvision.ops.nms(boxes_for_nms, scores, nms_iou_threshold)
         
-        # 根据 NMS 结果过滤
         scores = scores[keep_idx]
+        classes = classes[keep_idx] # 同步过滤类别
         decoded_pose = decoded_pose[keep_idx]
         
-        # 拼合结果
-        dets = torch.cat([scores.unsqueeze(1), decoded_pose], dim=1)
+        # 拼合结果: [score, class_id, x1, y1, x2, y2, x3, y3, x4, y4]
+        dets = torch.cat([scores.unsqueeze(1), classes.unsqueeze(1), decoded_pose], dim=1)
         batch_results.append(dets.detach().cpu().numpy())
         
     return batch_results

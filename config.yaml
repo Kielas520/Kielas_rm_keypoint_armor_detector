@@ -3,7 +3,7 @@ kielas_rm_train:
   train:
     device: "cuda"              # 可选: "auto", "cuda", "cpu"
     batch_size: 32
-    epochs: 100
+    epochs: 1
     weight_decay: 0.0005
     save_dir: "./model_res"
     input_size: [416, 416]
@@ -24,6 +24,7 @@ kielas_rm_train:
       nms_iou_threshold: 0.5
 
     data:
+      class_id: [0, 2, 5, 6, 8, 11]
       # --- 数据集路径与加载配置 ---
       train_img_dir: "./data/datasets/images/train"
       train_label_dir: "./data/datasets/labels/train"
@@ -36,10 +37,15 @@ kielas_rm_train:
       lambda_conf: 1.0
       lambda_box: 1.5
       lambda_pose: 3.0
+      lambda_cls: 2.0   # 新增分类损失的权重
+      pos_weight: 50.0
+    pck:
+      target_in_range_dist: 20.0
+      max_pixel_threshold: 2.5
     # --- 新增：提前停止机制 ---
     early_stopping:
       enabled: true        # 是否开启自动停止
-      min_val_loss: 0.05   # 验证集 loss 低于此值时触发停止
+      min_pck: 0.98        # 验证集 pck 高于此值就停止训练
 
   dataset:
     balance:

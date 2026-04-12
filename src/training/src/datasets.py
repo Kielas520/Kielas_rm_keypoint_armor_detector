@@ -75,12 +75,13 @@ def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52)
     return results
 
 class RMArmorDataset(Dataset):
-    def __init__(self, img_dir, label_dir, input_size=(320, 320), grid_size=(10, 10), transform=None, cache_device=None):
+    def __init__(self, img_dir, label_dir, class_id, input_size=(320, 320), grid_size=(10, 10), transform=None, cache_device=None):
         self.img_dir = img_dir
         self.label_dir = label_dir
         self.input_size = input_size
         self.grid_size = grid_size
         self.transform = transform
+        self.class_id = class_id
         
         self.samples = [f.split('.')[0] for f in os.listdir(label_dir) if f.endswith('.txt')]
         
@@ -125,6 +126,11 @@ class RMArmorDataset(Dataset):
         with open(label_path, 'r') as f:
             lines = f.readlines()
             
+        # --- 新增：定义你需要保留的类别 ID 白名单 ---
+        # 假设你只需要原标签中的类别 0, 1, 2, 3, 4, 5
+        # 如果不是连续的，比如 1, 3, 5，也可以直接填入集合
+        keep_classes = set(self.class_id)
+
         for line in lines:
             line = line.strip()
             if not line:
@@ -133,6 +139,13 @@ class RMArmorDataset(Dataset):
             parts = line.split(']')[-1].strip().split() 
             label_data = [float(x) for x in parts]
 
+            # 提取类别 ID
+            class_id = int(label_data[0])
+
+            # --- 新增核心逻辑：直接拦截不需要的类别 ---
+            if class_id not in keep_classes:
+                continue  # 直接跳过，不编码为目标张量，当作背景处理
+                
             for i in range(2, len(label_data)):
                 if i % 2 == 0: 
                     label_data[i] *= scale_x

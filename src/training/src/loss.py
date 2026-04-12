@@ -3,7 +3,7 @@ import torch.nn as nn
 from torchvision.ops import complete_box_iou_loss
 
 class RMDetLoss(nn.Module):
-    def __init__(self, lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.0, grid_size=(10, 10), pos_weight=50.0):
+    def __init__(self, lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.0, lambda_cls = 1.0, pos_weight=50.0, grid_size=(10, 10)):
         """
         联合损失函数模块
         lambda_conf, lambda_box, lambda_pose 分别为各项损失的权重系数
@@ -13,6 +13,7 @@ class RMDetLoss(nn.Module):
         self.lambda_conf = lambda_conf
         self.lambda_box = lambda_box
         self.lambda_pose = lambda_pose
+        self.lambda_cls = lambda_cls
         self.grid_w, self.grid_h = grid_size
         
         # 【修复】增加 pos_weight 提升正样本的惩罚权重，避免模型完全偏向预测背景
@@ -26,8 +27,9 @@ class RMDetLoss(nn.Module):
 
     def _decode_pred_boxes(self, boxes, grid_y, grid_x):
         """解码网络预测的边界框坐标"""
-        tx = torch.sigmoid(boxes[:, 0])
-        ty = torch.sigmoid(boxes[:, 1])
+        # 修改这里：引入尺度拉伸，适配多网格目标分配
+        tx = torch.sigmoid(boxes[:, 0]) * 2.0 - 0.5
+        ty = torch.sigmoid(boxes[:, 1]) * 2.0 - 0.5
         
         # 【修正部分】: 放弃使用单一 Sigmoid 压榨宽高，
         # 借用 YOLOv5 的缩放策略，使得网络更容易输出归一化后的相对尺度。
@@ -62,11 +64,12 @@ class RMDetLoss(nn.Module):
         
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
-    def forward(self, pred, target):
+    def forward(self, pred, target, target_class):
         """
         前向传播计算损失
-        pred:   [Batch, 13, H_grid, W_grid]
-        target: [Batch, 13, H_grid, W_grid]
+        pred:         [Batch, 19, H_grid, W_grid] (1置信度 + 4边框 + 8关键点 + 6分类 = 19通道)
+        target:       [Batch, 13, H_grid, W_grid] (不包含分类)
+        target_class: [Batch,  1, H_grid, W_grid] (真实的类别 ID: 0~5)
         """
         # 确保 pos_weight 所在的设备与预测张量一致
         if self.bce.pos_weight.device != pred.device:
@@ -90,6 +93,7 @@ class RMDetLoss(nn.Module):
                 'loss_conf': loss_conf.item(),
                 'loss_box': 0.0,
                 'loss_pose': 0.0,
+                'loss_cls': 0.0,
                 'total_loss': (loss_conf * self.lambda_conf).item()
             }
         
@@ -104,7 +108,7 @@ class RMDetLoss(nn.Module):
         pred_boxes_raw = pred[:, 1:5, :, :].permute(0, 2, 3, 1)[pos_mask]
         target_boxes_raw = target[:, 1:5, :, :].permute(0, 2, 3, 1)[pos_mask]
 
-        # 【修复】使用分离的解码方法
+        # 使用分离的解码方法
         pred_boxes = self._decode_pred_boxes(pred_boxes_raw, grid_y, grid_x)
         target_boxes = self._decode_target_boxes(target_boxes_raw, grid_y, grid_x)
         
@@ -119,18 +123,34 @@ class RMDetLoss(nn.Module):
         loss_pose = self.smooth_l1(pred_pose, target_pose)
 
         # -----------------------------------------
-        # 5. 计算带权重的总损失
+        # 5. 分类损失 (CrossEntropy Loss)
         # -----------------------------------------
+        # 取出 13~24 通道作为分类的 logits，共 12 个类
+        pred_cls = pred[:, 13:25, :, :].permute(0, 2, 3, 1)[pos_mask]
+        
+        # 提取真实的类别标签 (确保网络收到的是原本的 0~11 之间的 ID)
+        target_cls = target_class[:, 0, :, :][pos_mask] 
+        
+        # 使用交叉熵计算分类损失
+        loss_cls = nn.CrossEntropyLoss()(pred_cls, target_cls)
+
+        # -----------------------------------------
+        # 6. 计算带权重的总损失
+        # -----------------------------------------
+        lambda_cls = getattr(self, 'lambda_cls', 1.0)
+        
         total_loss = (
             self.lambda_conf * loss_conf + 
             self.lambda_box * loss_box + 
-            self.lambda_pose * loss_pose
+            self.lambda_pose * loss_pose +
+            lambda_cls * loss_cls
         )
 
         loss_dict = {
             'loss_conf': loss_conf.item(),
             'loss_box': loss_box.item(),
             'loss_pose': loss_pose.item(),
+            'loss_cls': loss_cls.item(),
             'total_loss': total_loss.item()
         }
 

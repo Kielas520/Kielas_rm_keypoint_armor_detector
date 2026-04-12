@@ -46,11 +46,11 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
     task_id = progress.add_task(f"[cyan]Train Epoch {epoch}", total=len(dataloader))
     
     for batch_idx, (imgs, targets, class_ids) in enumerate(dataloader):
-        imgs, targets = imgs.to(device), targets.to(device)
+        imgs, targets, class_ids =  imgs.to(device), targets.to(device), class_ids.to(device)
         
         optimizer.zero_grad()
         preds = model(imgs)
-        loss, loss_dict = criterion(preds, targets)
+        loss, loss_dict = criterion(preds, targets, class_ids)
         loss.backward()
         
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0) 
@@ -62,21 +62,86 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
     progress.remove_task(task_id)
     return total_loss / len(dataloader)
 
+def calculate_pck(gt_batch, pred_batch, pck_cfg):
+    """
+    计算批次数据的 PCK (Percentage of Correct Keypoints)
+    """
+    correct_kpts = 0
+    total_kpts = 0
+    target_in_range_dist = pck_cfg['target_in_range_dist']
+    threshold = pck_cfg['max_pixel_threshold']
+    for gt_dets, pred_dets in zip(gt_batch, pred_batch):
+        if len(gt_dets) == 0:
+            continue
+            
+        total_kpts += len(gt_dets) * 4 # 每个装甲板4个点
+        
+        if len(pred_dets) == 0:
+            continue
+            
+        for gt in gt_dets:
+            # 原本 decode_tensor 返回的是 [置信度, 8个关键点坐标]（共 9 个值），所以你用 [1:] 切片正好能拿出 8 个坐标去 reshape 成 (4, 2)。
+            # 现在它返回的是 [置信度, 类别ID, 8个关键点坐标]（共 10 个值），你再用 [1:] 切片就会拿到 9 个值，当然无法 reshape 成 4x2 的矩阵了。
+            # ---> 修改这里：从索引 2 开始切片 <---
+            gt_pts = gt[2:].reshape(4, 2)
+            gt_center = gt_pts.mean(axis=0)
+            
+            # 根据中心点距离寻找最佳匹配的预测框
+            best_pred = None
+            min_dist = float('inf')
+            
+            for pred in pred_dets:
+                # ---> 修改这里：从索引 2 开始切片 <---
+                pred_pts = pred[2:].reshape(4, 2)
+                pred_center = pred_pts.mean(axis=0)
+                dist = np.linalg.norm(gt_center - pred_center)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_pred = pred_pts
+            
+            # 如果找到了匹配的预测框
+            if min_dist < target_in_range_dist and best_pred is not None:
+                # 计算 4 个角点的独立欧氏距离
+                dists = np.linalg.norm(gt_pts - best_pred, axis=1)
+                # 统计距离小于阈值的点数
+                correct_kpts += np.sum(dists < threshold)
+                
+    return correct_kpts, total_kpts
+
 @torch.no_grad()
-def validate(model, dataloader, criterion, device, epoch, progress):
+def validate(model, dataloader, criterion, device, epoch, progress, input_size, grid_size, conf_thresh, nms_thresh, pck_cfg):
     model.eval()
     total_loss = 0.0
+    total_correct = 0
+    total_kpts = 0
+    
     task_id = progress.add_task(f"[magenta]Val Epoch {epoch}", total=len(dataloader))
     
     for imgs, targets, class_ids in dataloader:
-        imgs, targets = imgs.to(device), targets.to(device)
+        imgs, targets, class_ids = imgs.to(device), targets.to(device), class_ids.to(device)
         preds = model(imgs)
-        loss, _ = criterion(preds, targets)
+        # 修复传参遗漏：以前只有两个参数，现在必须传 class_ids
+        loss, _ = criterion(preds, targets, class_ids)
         total_loss += loss.item()
+        
+        # 解码张量以获取实际像素坐标
+        gt_dets = decode_tensor(targets, is_pred=False, conf_threshold=0.9, grid_size=grid_size, img_size=input_size)
+        pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh, grid_size=grid_size, img_size=input_size)
+        
+        # 计算 PCK@5
+        correct, total = calculate_pck(gt_dets, pred_dets, pck_cfg)
+        total_correct += correct
+        total_kpts += total
+        
         progress.update(task_id, advance=1)
         
     progress.remove_task(task_id)
-    return total_loss / len(dataloader)
+    
+    avg_loss = total_loss / len(dataloader)
+    # 如果没有真实标签，避免除以 0
+    pck_accuracy = (total_correct / total_kpts) if total_kpts > 0 else 0.0
+    
+    return avg_loss, pck_accuracy
 
 @torch.no_grad()
 def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, grid_size, num_samples=5, conf_threshold=0.5, nms_iou_threshold=0.45):
@@ -87,10 +152,11 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
     for imgs, targets, class_ids in dataloader:
         imgs = imgs.to(device)
         targets = targets.to(device)
+        class_ids = class_ids.to(device) # 确保 class_ids 在设备上
         preds = model(imgs) 
         
-        gt_dets = decode_tensor(targets, is_pred=False, conf_threshold=0.9, grid_size=grid_size, img_size=input_size)
-        # 在解码预测框时使用传入的配置
+        # 传入 class_ids 用于真实标签的正确解码
+        gt_dets = decode_tensor(targets, is_pred=False, class_tensor=class_ids, conf_threshold=0.9, grid_size=grid_size, img_size=input_size)
         pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=conf_threshold, nms_iou_threshold=nms_iou_threshold, grid_size=grid_size, img_size=input_size)
         
         for i in range(imgs.size(0)):
@@ -101,7 +167,6 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
             img_np = imgs[i].cpu().numpy().transpose(1, 2, 0)
             img_np = np.clip(img_np, 0, 1)
             
-            # 适当放大画布以容纳文字
             fig, ax = plt.subplots(1, figsize=(10, 8))
             ax.imshow(img_np)
             
@@ -109,36 +174,50 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
             # 绘制真实标签 (GT - 绿色)
             # ---------------------------
             for det in gt_dets[i]:
-                pts = det[1:].reshape(4, 2)
+                cls_id = int(det[1])
+                pts = det[2:].reshape(4, 2)
+                cx, cy = np.mean(pts[:, 0]), np.mean(pts[:, 1]) # 计算装甲板中心点
                 
-                # 1. 绘制四个角点 (散点)
                 ax.scatter(pts[:, 0], pts[:, 1], color='lime', s=20, zorder=3)
+                ax.plot([pts[0, 0], pts[1, 0]], [pts[0, 1], pts[1, 1]], color='lime', linewidth=2)
+                ax.plot([pts[2, 0], pts[3, 0]], [pts[2, 1], pts[3, 1]], color='lime', linewidth=2)
                 
-                # 2. 绘制左右灯条 
-                # 假设点序为: 0:左上, 1:左下, 2:右下, 3:右上
-                ax.plot([pts[0, 0], pts[1, 0]], [pts[0, 1], pts[1, 1]], color='lime', linewidth=2) # 左灯条
-                ax.plot([pts[2, 0], pts[3, 0]], [pts[2, 1], pts[3, 1]], color='lime', linewidth=2) # 右灯条
-                
-                # 3. 添加坐标文本
-                for pt in pts:
-                    ax.text(pt[0] + 5, pt[1], f"({int(pt[0])},{int(pt[1])})", color='lime', fontsize=8)
+                # 真实类别标注 (引向左上方)
+                ax.annotate(f"GT ID: {cls_id}",
+                            xy=(cx, cy), xycoords='data',
+                            xytext=(cx - 60, cy - 40), textcoords='data',
+                            color='lime', weight='bold', fontsize=10,
+                            arrowprops=dict(arrowstyle="-", color='lime', alpha=0.7),
+                            bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="lime", alpha=0.6))
             
             # ---------------------------
             # 绘制模型预测 (Pred - 红色)
             # ---------------------------
             for det in pred_dets[i]:
-                pts = det[1:].reshape(4, 2)
                 score = det[0]
+                cls_id = int(det[1])
+                pts = det[2:].reshape(4, 2)
+                cx, cy = np.mean(pts[:, 0]), np.mean(pts[:, 1]) # 计算装甲板中心点
                 
-                # 1. 绘制四个角点 (散点)
                 ax.scatter(pts[:, 0], pts[:, 1], color='red', s=20, zorder=3)
-                
-                # 2. 绘制左右灯条 (预测框用虚线区分)
                 ax.plot([pts[0, 0], pts[1, 0]], [pts[0, 1], pts[1, 1]], color='red', linewidth=2, linestyle='--')
                 ax.plot([pts[2, 0], pts[3, 0]], [pts[2, 1], pts[3, 1]], color='red', linewidth=2, linestyle='--')
                 
-                # 3. 添加置信度文本
-                ax.text(pts[0, 0], pts[0, 1] - 15, f"Conf: {score:.2f}", color='red', fontsize=12, weight='bold')
+                # 预测类别标注 (引向右上方)
+                ax.annotate(f"Pred ID: {cls_id}",
+                            xy=(cx, cy), xycoords='data',
+                            xytext=(cx + 60, cy - 40), textcoords='data',
+                            color='red', weight='bold', fontsize=10,
+                            arrowprops=dict(arrowstyle="-", color='red', alpha=0.7),
+                            bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="red", alpha=0.6))
+                
+                # 置信度标注 (引向右下方)
+                ax.annotate(f"Conf: {score:.2f}",
+                            xy=(cx, cy), xycoords='data',
+                            xytext=(cx + 60, cy + 40), textcoords='data',
+                            color='red', weight='bold', fontsize=10,
+                            arrowprops=dict(arrowstyle="-", color='red', alpha=0.7),
+                            bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="red", alpha=0.6))
             
             plt.title(f"{prefix} Set - Sample {count+1}\nGreen: GT | Red: Pred")
             plt.axis('off')
@@ -161,6 +240,7 @@ def main():
     
     train_cfg = cfg['train']
     loss_cfg = cfg['train']['loss']
+    pck_cfg = cfg['train']['pck']
     data_cfg = cfg['train']['data']
     post_cfg = cfg['train']['post_process']
     cache_loader = cfg['train']['cache_loader']
@@ -174,7 +254,7 @@ def main():
 
     early_stop_cfg = train_cfg.get('early_stopping', {})
     auto_stop_enabled = early_stop_cfg.get('enabled', False)
-    min_val_loss_threshold = float(early_stop_cfg.get('min_val_loss', 0.15))
+    min_pck = float(early_stop_cfg.get('min_pck', 0.98))
 
     device = torch.device("cuda" if torch.cuda.is_available() and train_cfg['device'] == 'auto' else train_cfg['device'])
     save_dir = Path(train_cfg.get('save_dir', "./model_res"))
@@ -215,9 +295,10 @@ def main():
         RMArmorDataset(
             data_cfg['train_img_dir'], 
             data_cfg['train_label_dir'],
+            data_cfg['class_id'],
             input_size=input_size, 
             grid_size=grid_size,
-            cache_device=cache_dev
+            cache_device=cache_dev           
         ),
         batch_size=train_cfg['batch_size'], 
         shuffle=True, 
@@ -231,6 +312,7 @@ def main():
         RMArmorDataset(
             data_cfg['val_img_dir'], 
             data_cfg['val_label_dir'],
+            data_cfg['class_id'],
             input_size=input_size, 
             grid_size=grid_size,
             cache_device=cache_dev
@@ -248,6 +330,8 @@ def main():
         loss_cfg['lambda_conf'], 
         loss_cfg['lambda_box'], 
         loss_cfg['lambda_pose'],
+        loss_cfg['lambda_cls'],
+        loss_cfg['pos_weight'],
         grid_size=grid_size
     ).to(device)
     
@@ -267,16 +351,17 @@ def main():
 
     warmup_epochs = max(1, int(epochs * 0.05))
 
-    # 定义基于 Loss 的调度器 (读取 config 中的参数)
+    # 定义基于 PCK 的调度器 (监控指标越大越好)
     scheduler = ReduceLROnPlateau(
         optimizer,
-        mode='min',          # 监控的指标期望是越小越好 (Loss)
-        factor=lr_factor,    # 触发时，学习率乘以的系数
-        patience=lr_patience,# 容忍多少个 epoch Loss 不下降才触发衰减
-        min_lr=1e-6          # 设定的最小学习率底线
+        mode='max',          # 这里改为 max，因为 PCK 越高越好
+        factor=lr_factor,    
+        patience=lr_patience,
+        min_lr=1e-6          
     )
 
-    best_val_loss = float('inf')
+    best_val_pck = 0.0       # 替换原有的 best_val_loss = float('inf')
+
     console.print("[bold green]开始训练...[/bold green]")
     
     with Progress(
@@ -292,34 +377,37 @@ def main():
         for epoch in range(1, epochs + 1):
             # --- 1. 执行训练和验证 ---
             train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress)
-            val_loss = validate(model, val_loader, criterion, device, epoch, progress)
+            # 传入新增的解码参数
+            val_loss, val_pck = validate(model, val_loader, criterion, device, epoch, progress, input_size, grid_size, conf_thresh, nms_thresh, pck_cfg)
             
             # --- 2. 学习率调度逻辑 ---
             if epoch <= warmup_epochs:
-                # 处于 Warmup 阶段：线性增加学习率
                 current_lr = base_lr * (epoch / warmup_epochs)
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = current_lr
             else:
-                # Warmup 结束后：根据验证集 Loss 动态调整
-                scheduler.step(val_loss)
+                # 改为监控 PCK 指标
+                scheduler.step(val_pck)
                 current_lr = optimizer.param_groups[0]['lr']
 
             # --- 3. 记录与打印 ---
             history['train'].append(train_loss)
-            history['val'].append(val_loss)
+            history['val'].append(val_pck) # history 这里为了方便直接存 pck
             history['lr'].append(current_lr)
             
-            console.print(f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | LR: {current_lr:.6f} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            console.print(f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | LR: {current_lr:.6f} | Train Loss: {train_loss:.4f} | Val PCK@5: {val_pck:.4f}")
             
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            # 核心修改：以 PCK 最高作为保存最佳权重的依据
+            if val_pck > best_val_pck:
+                best_val_pck = val_pck
                 torch.save(model.state_dict(), save_dir / "best_model.pth")
+                console.print(f"[green]  -> 发现更高 PCK: {val_pck:.4f}，模型已保存。[/green]")
             
             progress.update(epoch_task, advance=1)
             
-            if auto_stop_enabled and val_loss <= min_val_loss_threshold:
-                console.print(f"\n[bold yellow]验证集 Loss ({val_loss:.4f}) 已达到设定的停止阈值 ({min_val_loss_threshold})，提前终止训练。[/bold yellow]")
+            # 早停机制也建议根据 PCK 来，比如连续 N 个 epoch PCK 达到 0.98 以上即可停止
+            if auto_stop_enabled and val_pck >= min_pck:
+                console.print(f"\n[bold yellow]验证集 PCK ({val_pck:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
                 break
                 
         torch.save(model.state_dict(), save_dir / "last_model.pth")
@@ -327,7 +415,7 @@ def main():
         
         log_file = save_dir / "train_log.txt"
         with log_file.open("w", encoding="utf-8") as f:
-            f.write("Epoch\tLR\tTrain_Loss\tVal_Loss\n")
+            f.write("Epoch\tLR\tTrain_Loss\tVal_PCK\n")
             for i in range(len(history['train'])):
                 f.write(f"{i+1}\t{history['lr'][i]:.6f}\t{history['train'][i]:.6f}\t{history['val'][i]:.6f}\n")
         # 1. 显式删除带有 persistent_workers 的 DataLoader 并强制垃圾回收，等待后台进程安全退出
@@ -342,6 +430,7 @@ def main():
         vis_train_dataset = RMArmorDataset(
             data_cfg['train_img_dir'], 
             data_cfg['train_label_dir'],
+            data_cfg['class_id'],
             input_size=input_size, 
             grid_size=grid_size,
             cache_device=cache_dev
@@ -350,6 +439,7 @@ def main():
         vis_val_dataset = RMArmorDataset(
             data_cfg['val_img_dir'], 
             data_cfg['val_label_dir'],
+            data_cfg['class_id'],
             input_size=input_size, 
             grid_size=grid_size,
             cache_device=cache_dev
