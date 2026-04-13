@@ -9,8 +9,8 @@ from pathlib import Path
 # DLL 与 路径初始化
 # ================================================= #
 BASE_DIR = Path(__file__).resolve().parent
-LIB_DIR = BASE_DIR / "hik_lib"
-MV_IMPORT_PATH = BASE_DIR / "MvImport"
+LIB_DIR = BASE_DIR.parent / "hik_lib"
+MV_IMPORT_PATH = BASE_DIR.parent / "MvImport"
 
 if LIB_DIR.exists() and hasattr(os, 'add_dll_directory'):
     os.add_dll_directory(str(LIB_DIR))
@@ -132,41 +132,3 @@ class HikCamera:
 
     def __del__(self):
         self.close()
-
-# ================================================= #
-# 使用示例
-# ================================================= #
-if __name__ == "__main__":
-    cap = HikCamera(0)
-    
-    if not cap.open():
-        print("❌ 无法打开相机")
-        sys.exit()
-
-    # 设置初始曝光：例如 10000us (10ms)
-    cap.set_exposure(10000, auto_mode=False)
-
-    print(f"📷 当前曝光时间: {cap.get_exposure()} us")
-    print("按 'W' 增加曝光，'S' 减少曝光，'Q' 退出")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("读取帧失败")
-            break
-
-        # 显示
-        cv2.imshow('HikRobot Camera', frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('w'):
-            current = cap.get_exposure()
-            cap.set_exposure(current + 1000) # 增加 1ms
-        elif key == ord('s'):
-            current = cap.get_exposure()
-            cap.set_exposure(max(100, current - 1000)) # 减少 1ms
-
-    cap.close()
-    cv2.destroyAllWindows()

@@ -8,10 +8,10 @@ import ctypes
 
 from ctypes import *
 
-from PixelType_header import *
-from CameraParams_const import *
-from CameraParams_header import *
-from MvErrorDefine_const import *
+from tools.hik_camera.MvImport.PixelType_header import *
+from tools.hik_camera.MvImport.CameraParams_const import *
+from tools.hik_camera.MvImport.CameraParams_header import *
+from tools.hik_camera.MvImport.MvErrorDefine_const import *
 
 
 # 根据平台设置调用约定

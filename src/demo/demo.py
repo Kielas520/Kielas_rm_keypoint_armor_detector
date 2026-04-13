@@ -13,7 +13,7 @@ from src.training.src.model import RMDetector, decode_tensor
 
 # 2. 导入海康相机
 # 路径：src -> hik_camera -> hik_camera.py
-from src.hik_camera.hik_camera import HikCamera
+from tools.hik_camera.src.hik_camera import HikCamera
 
 console = Console()
 
