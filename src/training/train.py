@@ -20,9 +20,7 @@ import shutil
 import gc
 
 # 导入模块
-from src.datasets import RMArmorDataset
-from src.model import RMDetector, decode_tensor
-from src.loss import RMDetLoss
+from src.training.src import *
 
 console = Console()
 
@@ -398,7 +396,7 @@ def main():
             history['lr'].append(current_lr)
             
             console.print(f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | LR: {current_lr:.6f} | Train Loss: {train_loss:.4f} | Val PCK@0.5: {val_pck:.4f}")
-            
+
             # 核心修改：以 PCK 最高作为保存最佳权重的依据
             if val_pck > best_val_pck:
                 best_val_pck = val_pck
@@ -411,7 +409,7 @@ def main():
             if auto_stop_enabled and val_pck >= min_pck:
                 console.print(f"\n[bold yellow]验证集 PCK ({val_pck:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
                 break
-                
+
         torch.save(model.state_dict(), save_dir / "last_model.pth")
         plot_history(history, save_dir / "loss_curve.png")
         
@@ -426,7 +424,14 @@ def main():
         gc.collect()
 
         console.print("\n[bold cyan]正在生成识别效果可视化图片...[/bold cyan]")
-        model.load_state_dict(torch.load(save_dir / "best_model.pth"))
+
+        # train.py 建议修改位置
+        best_model_path = save_dir / "best_model.pth"
+        if best_model_path.exists():
+            model.load_state_dict(torch.load(best_model_path))
+        else:
+            console.print("[yellow]警告：未发现最佳模型文件，将使用最后一次迭代的权重进行可视化。[/yellow]")
+            model.load_state_dict(torch.load(save_dir / "last_model.pth"))
         
         # 2. 重新实例化 Dataset，彻底阻断与之前多进程上下文的联系
         vis_train_dataset = RMArmorDataset(

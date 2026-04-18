@@ -3,7 +3,7 @@ name = "kielas-rm-detector-train"
 version = "0.1.0"
 description = "跨平台 rm 视觉关键点检测环境"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.11.*"
 authors = [{ name = "Kielas", email = "c1470759@outlook.com" }]
 
 # 基础通用依赖（不含 torch，由下方 groups 注入）
@@ -17,7 +17,7 @@ dependencies = [
     "matplotlib>=3.10.*",
     "ipywidgets>=8.0.0",
     "onnx",
-    "onnxsim",
+    "onnxsim==0.4.36",
     "onnxscript",
     "onnxruntime<1.24.0",
     # --- 平台特定的依赖直接写在主列表，依靠 sys_platform 自动触发 ---

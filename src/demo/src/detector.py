@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import yaml
 from pathlib import Path
-from src.training.src.model import RMDetector, decode_tensor
+from src.training.src import RMDetector, decode_tensor
 
 class Detector:
     def __init__(self, config_path="./config.yaml"):
@@ -33,7 +33,7 @@ class Detector:
             self.session = ort.InferenceSession(model_path, providers=providers)
             self.input_name = self.session.get_inputs()[0].name
         elif self.model_type == "pytorch":
-            self.model = ModelStructure().to(self.device)
+            self.model = RMDetector().to(self.device)
             self.model.load_state_dict(torch.load(model_path, map_location=self.device))
             self.model.eval()
         elif self.model_type == "torchscript":

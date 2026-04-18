@@ -1,6 +1,6 @@
 import sys
 import cv2
-from tools.hik_camera.src.hik_camera import HikCamera
+from tools.hik_camera.src import HikCamera
 
 cap = HikCamera(0)
 

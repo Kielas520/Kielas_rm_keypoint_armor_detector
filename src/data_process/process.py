@@ -6,11 +6,8 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 
 # 导入各个数据处理模块
-from src.purify import *
-from src.balance import *
-from src.augment import *
-from src.visiualize import *
-from src.split import * 
+from src.data_process.src import *
+
 console = Console()
 
 def load_balance_config(config_path="config.yaml"):
