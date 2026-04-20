@@ -6,7 +6,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.status import Status
 from rich.panel import Panel
-
+import torchvision
 # 1. 导入模型组件
 # 路径：src -> training -> src -> model.py
 from src.training.src.model import RMDetector, decode_tensor
@@ -18,7 +18,6 @@ from tools.hik_camera.src.hik_camera import HikCamera
 console = Console()
 
 class InferenceEngine:
-    # ... (保持你原有的 InferenceEngine 类代码不变)
     def __init__(self, cfg):
         self.type = cfg['model_type'].lower()
         self.device = torch.device(cfg.get('device', 'cpu'))
@@ -44,14 +43,52 @@ class InferenceEngine:
     def __call__(self, x_tensor):
         if self.type == "onnx":
             x_np = x_tensor.cpu().numpy()
-            out_np = self.session.run(None, {self.input_name: x_np})[0]
-            return torch.from_numpy(out_np).to(self.device)
+            # 移除结尾的 [0]，接收完整的输出列表
+            out_nps = self.session.run(None, {self.input_name: x_np})
+            return [torch.from_numpy(out).to(self.device) for out in out_nps]
         else:
             with torch.no_grad():
                 return self.model(x_tensor)
 
+def process_multi_scale_preds(preds, strides, input_size, reg_max, conf_thresh, nms_thresh):
+    """处理多尺度预测列表，并执行跨尺度 NMS"""
+    # 兼容处理：确保 preds 始终是列表
+    if not isinstance(preds, list):
+        preds = [preds]
+        
+    batch_size = preds[0].size(0)
+    pred_dets_batch = [[] for _ in range(batch_size)]
+    
+    for i, s in enumerate(strides):
+        current_grid = (input_size[0] // s, input_size[1] // s)
+        pred_scale = decode_tensor(
+            preds[i], is_pred=True, conf_threshold=conf_thresh, 
+            nms_iou_threshold=nms_thresh, grid_size=current_grid, 
+            reg_max=reg_max, img_size=input_size
+        )
+        
+        for b in range(batch_size):
+            if len(pred_scale[b]) > 0:
+                pred_dets_batch[b].append(pred_scale[b])
+                
+    final_pred_dets = []
+    for b in range(batch_size):
+        if len(pred_dets_batch[b]) > 0:
+            merged_preds = np.concatenate(pred_dets_batch[b], axis=0)
+            scores = torch.tensor(merged_preds[:, 0])
+            pts = torch.tensor(merged_preds[:, 2:]).view(-1, 4, 2)
+            min_xy, _ = torch.min(pts, dim=1)
+            max_xy, _ = torch.max(pts, dim=1)
+            boxes = torch.cat([min_xy, max_xy], dim=1)
+            
+            keep = torchvision.ops.nms(boxes, scores, nms_thresh)
+            final_pred_dets.append(merged_preds[keep.numpy()])
+        else:
+            final_pred_dets.append([])
+            
+    return final_pred_dets
+
 def draw_and_extract(frame, dets, orig_shape, input_size):
-    # ... (保持你原有的绘制函数不变)
     orig_h, orig_w = orig_shape
     scale_x, scale_y = orig_w / input_size[0], orig_h / input_size[1]
     color_red, color_black = (0, 0, 255), (0, 0, 0)
@@ -86,7 +123,11 @@ def main():
     with open(config_file, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)['kielas_rm_demo']
     
-    input_sz, grid_sz = tuple(cfg['input_size']), tuple(cfg['grid_size'])
+    # --- 修改点 1：读取 strides 替代 grid_size ---
+    input_sz = tuple(cfg['input_size'])
+    strides = cfg.get('strides', [8, 16, 32])
+    reg_max = cfg.get('reg_max', 16)
+    
     conf_t, nms_t = cfg['conf_threshold'], cfg['nms_iou_threshold']
     device = torch.device(cfg.get('device', 'cpu'))
     
@@ -130,18 +171,19 @@ def main():
             img_tensor = img_tensor.unsqueeze(0).to(device)
             
             preds = engine(img_tensor)
-            dets = decode_tensor(
+            # --- 修改点 2：使用新的多尺度处理函数替代 decode_tensor ---
+            dets = process_multi_scale_preds(
                 preds, 
-                is_pred=True, 
-                conf_threshold=conf_t, 
-                nms_iou_threshold=nms_t, 
-                grid_size=grid_sz, 
-                img_size=input_sz
+                strides=strides, 
+                input_size=input_sz, 
+                reg_max=reg_max,
+                conf_thresh=conf_t, 
+                nms_thresh=nms_t
             )
             
             fps = cv2.getTickFrequency() / (cv2.getTickCount() - st)
             
-            # 绘制
+            # 绘制 (如果 dets[0] 为空需要做好保护，原代码已有)
             out_frame, info = draw_and_extract(raw_frame, dets[0], orig_shape, input_sz)
             
             # 叠加状态

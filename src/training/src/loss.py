@@ -103,19 +103,17 @@ class RMDetLoss(nn.Module):
         
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
-    def compute_single_scale_loss(self, pred, target, target_class):
-        """计算单个尺度的损失"""
-        # 动态获取当前尺度的网格宽高
+    def compute_single_scale_loss(self, pred, target, target_class, global_num_pos): # 新增参数 global_num_pos
         grid_h, grid_w = pred.shape[2], pred.shape[3]
         
-        # 1. 置信度损失
         pred_conf = pred[:, 0, :, :]
         target_conf = target[:, 0, :, :]
         
         loss_conf_sum = self.focal_loss(pred_conf, target_conf)
         pos_mask = (target_conf == 1.0)
-        num_pos = torch.clamp(pos_mask.sum(), min=1.0) 
-        loss_conf = loss_conf_sum / num_pos
+        
+        # 【关键修复】：使用全局正样本数量进行归一化
+        loss_conf = loss_conf_sum / global_num_pos
 
         if not pos_mask.any():
             return loss_conf * self.lambda_conf, {
@@ -193,12 +191,6 @@ class RMDetLoss(nn.Module):
         return total_loss, loss_dict
 
     def forward(self, preds, targets, target_classes):
-        """
-        多尺度前向传播
-        preds: 包含 3 个尺度预测张量的列表 [p3, p4, p5]
-        targets: 包含 3 个尺度目标张量的列表
-        target_classes: 包含 3 个尺度类别张量的列表
-        """
         total_loss = 0.0
         combined_loss_dict = {
             'loss_conf': 0.0, 
@@ -208,9 +200,15 @@ class RMDetLoss(nn.Module):
             'total_loss': 0.0
         }
         
+        # 【关键修复】：提前遍历所有尺度，计算全局的正样本数量
+        global_num_pos = 0.0
+        for i in range(len(targets)):
+            global_num_pos += (targets[i][:, 0, :, :] == 1.0).sum().float()
+        global_num_pos = torch.clamp(global_num_pos, min=1.0)
+        
         num_scales = len(preds)
         for i in range(num_scales):
-            loss_scale, dist_scale = self.compute_single_scale_loss(preds[i], targets[i], target_classes[i])
+            loss_scale, dist_scale = self.compute_single_scale_loss(preds[i], targets[i], target_classes[i], global_num_pos)
             
             total_loss += loss_scale
             for k in combined_loss_dict:

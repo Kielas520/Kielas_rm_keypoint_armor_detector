@@ -4,7 +4,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import cv2
-import torchvision # 新增，用于跨尺度 NMS
+import torchvision 
 
 # 强制关闭 OpenCV 内部多线程与 OpenCL，防止多进程数据加载时 CPU 和内存跑满
 cv2.setNumThreads(0)
@@ -26,26 +26,48 @@ from src.training.src import *
 
 console = Console()
 
-def plot_history(history, save_path):
+def plot_and_save_curve(data, epochs, title, ylabel, save_path, color='b'):
+    """通用单图绘制函数"""
     plt.figure(figsize=(10, 6))
-    epochs = range(1, len(history['train']) + 1)
-    plt.plot(epochs, history['train'], 'b-', label='Train Loss')
-    plt.plot(epochs, history['val'], 'r-', label='Val Pck')
-    plt.title('Training and Validation Loss')
+    plt.plot(epochs, data, color=color, linestyle='-', label=title, linewidth=2)
+    plt.title(title)
     plt.xlabel('Epochs')
-    plt.ylabel('Loss')
+    plt.ylabel(ylabel)
     plt.legend()
-    plt.grid(True)
-    plt.savefig(save_path)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.savefig(save_path, bbox_inches='tight', dpi=150)
     plt.close()
+
+def save_training_curves(history, save_dir):
+    """像 YOLO 一样分别保存多种指标曲线"""
+    epochs = range(1, len(history['val_pck']) + 1)
+    
+    # 单独保存各项 Loss 和 指标
+    plot_and_save_curve(history['train_total'], epochs, 'Total Training Loss', 'Loss', save_dir / "loss_total.png", 'b')
+    plot_and_save_curve(history['train_conf'], epochs, 'Confidence Loss', 'Loss', save_dir / "loss_conf.png", 'orange')
+    plot_and_save_curve(history['train_box'], epochs, 'Box Loss', 'Loss', save_dir / "loss_box.png", 'green')
+    plot_and_save_curve(history['train_pose'], epochs, 'Pose (Keypoints) Loss', 'Loss', save_dir / "loss_pose.png", 'purple')
+    plot_and_save_curve(history['train_cls'], epochs, 'Classification Loss', 'Loss', save_dir / "loss_cls.png", 'brown')
+    
+    # 验证集评估指标 PCK 单独保存
+    plot_and_save_curve(history['val_pck'], epochs, 'Validation PCK@0.5', 'PCK', save_dir / "val_pck.png", 'r')
+
 
 def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress, scaler):
     model.train()
-    total_loss = 0.0
+    
+    # 初始化记录各项 Loss 的字典
+    epoch_losses = {
+        'loss_conf': 0.0,
+        'loss_box': 0.0,
+        'loss_pose': 0.0,
+        'loss_cls': 0.0,
+        'total_loss': 0.0
+    }
+    
     task_id = progress.add_task(f"[cyan]Train Epoch {epoch}", total=len(dataloader))
     
     for batch_idx, (imgs, targets, class_ids) in enumerate(dataloader):
-        # imgs 是单张量，targets 和 class_ids 是多尺度列表，需要遍历移动到 device
         imgs = imgs.to(device)
         targets = [t.to(device) for t in targets]
         class_ids = [c.to(device) for c in class_ids]
@@ -54,7 +76,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
         
         # 开启自动混合精度 (AMP) - 前向传播
         with torch.autocast(device_type=device.type, dtype=torch.float16):
-            preds = model(imgs) # preds 也是包含三个尺度输出的列表
+            preds = model(imgs) 
             loss, loss_dict = criterion(preds, targets, class_ids)
             
         # 使用 scaler 放大 loss 并进行反向传播
@@ -68,11 +90,20 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
         scaler.step(optimizer)
         scaler.update()
         
-        total_loss += loss.item()
-        progress.update(task_id, advance=1, description=f"[cyan]Train Epoch {epoch} | Loss: {loss.item():.4f}")
+        # 累加各项 Loss
+        for k in epoch_losses:
+            epoch_losses[k] += loss_dict[k]
+            
+        progress.update(task_id, advance=1, description=f"[cyan]Train Epoch {epoch} | Total Loss: {loss.item():.4f} | Conf: {loss_dict['loss_conf']:.4f}")
         
     progress.remove_task(task_id)
-    return total_loss / len(dataloader)
+    
+    # 取该 Epoch 各项 Loss 的平均值
+    num_batches = len(dataloader)
+    for k in epoch_losses:
+        epoch_losses[k] /= num_batches
+        
+    return epoch_losses
 
 def calculate_pck(gt_batch, pred_batch, pck_cfg):
     """
@@ -314,20 +345,30 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() and train_cfg['device'] == 'auto' else train_cfg['device'])
     save_dir = Path(train_cfg.get('save_dir', "./model_res"))
     
-    if save_dir.exists() and any(save_dir.iterdir()):
-        overwrite = Confirm.ask(f"[bold yellow]输出文件夹 '{save_dir}' 已存在且包含文件，是否清空并刷新？[/bold yellow]")
-        if overwrite:
-            shutil.rmtree(save_dir)
-            save_dir.mkdir(parents=True, exist_ok=True)
-            console.print("[green]已清空历史文件夹。[/green]")
-        else:
-            console.print("[bold red]已取消训练任务以保护现有文件。[/bold red]")
-            return
-    else:
-        save_dir.mkdir(parents=True, exist_ok=True)
+    # if save_dir.exists() and any(save_dir.iterdir()):
+    #     overwrite = Confirm.ask(f"[bold yellow]输出文件夹 '{save_dir}' 已存在且包含文件，是否清空并刷新？[/bold yellow]")
+    #     if overwrite:
+    #         shutil.rmtree(save_dir)
+    #         save_dir.mkdir(parents=True, exist_ok=True)
+    #         console.print("[green]已清空历史文件夹。[/green]")
+    #     else:
+    #         console.print("[bold red]已取消训练任务以保护现有文件。[/bold red]")
+    #         return
+    # else:
+    #     save_dir.mkdir(parents=True, exist_ok=True)
     
     epochs = train_cfg['epochs']
-    history = {'train': [], 'val': [], 'lr': []}
+    
+    # 修改了历史记录，新增分项Loss记录
+    history = {
+        'train_total': [], 
+        'train_conf': [], 
+        'train_box': [], 
+        'train_pose': [], 
+        'train_cls': [], 
+        'val_pck': [], 
+        'lr': []
+    }
 
     input_size = tuple(train_cfg.get('input_size', [416, 416]))
     # 获取多尺度 strides，默认为 [8, 16, 32]
@@ -352,7 +393,7 @@ def main():
             data_cfg['train_label_dir'],
             data_cfg['class_id'],
             input_size=input_size, 
-            strides=strides, # 替换原来的 grid_size
+            strides=strides, 
             cache_device=cache_dev,
             force_no_cache=False          
         ),
@@ -369,7 +410,7 @@ def main():
             data_cfg['val_label_dir'],
             data_cfg['class_id'],
             input_size=input_size, 
-            strides=strides, # 替换原来的 grid_size
+            strides=strides, 
             cache_device=cache_dev,
             force_no_cache=False
         ),
@@ -389,7 +430,6 @@ def main():
         else:
             console.print(f"[bold yellow]警告：未找到指定的权重文件 {weight_path}，将从头开始训练。[/bold yellow]")
 
-    # 注意：新的 Loss 已动态处理 grid_size，这里无需再传入固定 grid_size
     criterion = RMDetLoss(
         loss_cfg['lambda_conf'], 
         loss_cfg['lambda_box'], 
@@ -433,8 +473,9 @@ def main():
         epoch_task = progress.add_task("[bold green]总体训练进度", total=epochs)
         
         for epoch in range(1, epochs + 1):
-            train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress, scaler)
-            # 传入多尺度 strides
+            
+            # 接收带有分类/分项Loss的字典
+            epoch_losses = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress, scaler)
             val_loss, val_pck = validate(model, val_loader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, nms_thresh, pck_cfg)
             
             if epoch <= warmup_epochs:
@@ -445,11 +486,17 @@ def main():
                 scheduler.step()
                 current_lr = optimizer.param_groups[0]['lr']
 
-            history['train'].append(train_loss)
-            history['val'].append(val_pck)
+            # 更新至历史记录字典中
+            history['train_total'].append(epoch_losses['total_loss'])
+            history['train_conf'].append(epoch_losses['loss_conf'])
+            history['train_box'].append(epoch_losses['loss_box'])
+            history['train_pose'].append(epoch_losses['loss_pose'])
+            history['train_cls'].append(epoch_losses['loss_cls'])
+            
+            history['val_pck'].append(val_pck)
             history['lr'].append(current_lr)
             
-            console.print(f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | LR: {current_lr:.6f} | Train Loss: {train_loss:.4f} | Val PCK@0.5: {val_pck:.4f}")
+            console.print(f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | LR: {current_lr:.6f} | Train Total: {epoch_losses['total_loss']:.4f} | Pose: {epoch_losses['loss_pose']:.4f} | Val PCK: {val_pck:.4f}")
 
             if val_pck > best_val_pck:
                 best_val_pck = val_pck
@@ -463,13 +510,17 @@ def main():
                 break
 
         torch.save(model.state_dict(), save_dir / "last_model.pth")
-        plot_history(history, save_dir / "loss_curve.png")
         
+        # 分离保存多张曲线图片
+        save_training_curves(history, save_dir)
+        
+        # 更新日志写入逻辑，将多项损失分别打表记录
         log_file = save_dir / "train_log.txt"
         with log_file.open("w", encoding="utf-8") as f:
-            f.write("Epoch\tLR\tTrain_Loss\tVal_PCK\n")
-            for i in range(len(history['train'])):
-                f.write(f"{i+1}\t{history['lr'][i]:.6f}\t{history['train'][i]:.6f}\t{history['val'][i]:.6f}\n")
+            f.write("Epoch\tLR\tTotal_Loss\tConf_Loss\tBox_Loss\tPose_Loss\tCls_Loss\tVal_PCK\n")
+            for i in range(len(history['val_pck'])):
+                f.write(f"{i+1}\t{history['lr'][i]:.6f}\t{history['train_total'][i]:.6f}\t{history['train_conf'][i]:.6f}\t"
+                        f"{history['train_box'][i]:.6f}\t{history['train_pose'][i]:.6f}\t{history['train_cls'][i]:.6f}\t{history['val_pck'][i]:.6f}\n")
                 
         del train_loader
         del val_loader
