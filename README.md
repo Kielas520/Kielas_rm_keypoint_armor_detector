@@ -103,6 +103,7 @@ python main.py
 ```
 **配置 (`config.yaml` -> `kielas_rm_demo`):**
 - 支持标准 `usb` 摄像头或 `hik` 海康工业相机。
+- 请自行导入和配置hik相机依赖 -> [HikPy](https://github.com/Kielas520/HikPy.git)
 - 支持在运行时通过热键 `W / S` 动态调整相机曝光度。
 - 支持直接加载 `.onnx` 使用 ONNXRuntime 推理，或 `.pt` 加载 TorchScript。
 
