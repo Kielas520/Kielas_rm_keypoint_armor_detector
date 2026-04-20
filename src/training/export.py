@@ -5,7 +5,7 @@ from rich.console import Console
 from rich.status import Status
 from rich.panel import Panel
 
-from src.model import RMDetector
+from src.training.src import RMDetector
 
 # 初始化 rich 终端控制台
 console = Console()
