@@ -52,17 +52,17 @@ def keypoint_nms(pts, scores, dist_thresh=15.0):
 
     return torch.tensor(keep, dtype=torch.int64, device=pts.device)
 
-class ConvBNReLU(nn.Module):
+class ConvBNSiLU(nn.Module):
     """标准的卷积块，支持调整 kernel_size 和 padding"""
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, 
                               stride=stride, padding=padding, bias=False)
         self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
+        self.silu = nn.SiLU(inplace=True)
 
     def forward(self, x):
-        return self.relu(self.bn(self.conv(x)))
+        return self.silu(self.bn(self.conv(x)))
 
 class DepthwiseConvBlock(nn.Module):
     """深度可分离卷积块 (Depthwise Separable Convolution) - 已增加残差连接支持"""
@@ -74,16 +74,16 @@ class DepthwiseConvBlock(nn.Module):
         self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=3, 
                                    stride=stride, padding=1, groups=in_channels, bias=False)
         self.bn1 = nn.BatchNorm2d(in_channels)
-        self.relu1 = nn.ReLU(inplace=True)
+        self.silu1 = nn.SiLU(inplace=True)
         
         self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, 
                                    stride=1, padding=0, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
-        self.relu2 = nn.ReLU(inplace=True)
+        self.silu2 = nn.SiLU(inplace=True)
 
     def forward(self, x):
-        out = self.relu1(self.bn1(self.depthwise(x)))
-        out = self.relu2(self.bn2(self.pointwise(out)))
+        out = self.silu1(self.bn1(self.depthwise(x)))
+        out = self.silu2(self.bn2(self.pointwise(out)))
         if self.use_res:
             return x + out
         return out
@@ -108,8 +108,8 @@ class SPPF(nn.Module):
     def __init__(self, in_channels, out_channels, k=5):
         super().__init__()
         c_ = in_channels // 2  
-        self.cv1 = ConvBNReLU(in_channels, c_, kernel_size=1, padding=0)
-        self.cv2 = ConvBNReLU(c_ * 4, out_channels, kernel_size=1, padding=0)
+        self.cv1 = ConvBNSiLU(in_channels, c_, kernel_size=1, padding=0)
+        self.cv2 = ConvBNSiLU(c_ * 4, out_channels, kernel_size=1, padding=0)
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
 
     def forward(self, x):
@@ -130,12 +130,12 @@ class RMHead(nn.Module):
         
         # 解耦头：分类和回归使用独立的卷积分支
         self.cls_convs = nn.Sequential(
-            ConvBNReLU(in_channels, in_channels, kernel_size=3, padding=1),
-            ConvBNReLU(in_channels, in_channels, kernel_size=3, padding=1)
+            ConvBNSiLU(in_channels, in_channels, kernel_size=3, padding=1),
+            ConvBNSiLU(in_channels, in_channels, kernel_size=3, padding=1)
         )
         self.reg_convs = nn.Sequential(
-            ConvBNReLU(in_channels, in_channels, kernel_size=3, padding=1),
-            ConvBNReLU(in_channels, in_channels, kernel_size=3, padding=1)
+            ConvBNSiLU(in_channels, in_channels, kernel_size=3, padding=1),
+            ConvBNSiLU(in_channels, in_channels, kernel_size=3, padding=1)
         )
         
         # 分类分支同时承担正负样本判别任务
@@ -166,15 +166,15 @@ class RMNeck(nn.Module):
         
         # Top-down
         self.up = nn.Upsample(scale_factor=2, mode='nearest')
-        self.conv_f5 = ConvBNReLU(c5, out_channels, 1, padding=0)
-        self.conv_f4 = ConvBNReLU(c4 + out_channels, out_channels, 1, padding=0)
-        self.conv_f3 = ConvBNReLU(c3 + out_channels, out_channels, 1, padding=0)
+        self.conv_f5 = ConvBNSiLU(c5, out_channels, 1, padding=0)
+        self.conv_f4 = ConvBNSiLU(c4 + out_channels, out_channels, 1, padding=0)
+        self.conv_f3 = ConvBNSiLU(c3 + out_channels, out_channels, 1, padding=0)
         
         # Bottom-up
-        self.down_p3 = ConvBNReLU(out_channels, out_channels, 3, stride=2, padding=1)
-        self.conv_p4 = ConvBNReLU(out_channels * 2, out_channels, 1, padding=0)
-        self.down_p4 = ConvBNReLU(out_channels, out_channels, 3, stride=2, padding=1)
-        self.conv_p5 = ConvBNReLU(out_channels + c5, out_channels, 1, padding=0)
+        self.down_p3 = ConvBNSiLU(out_channels, out_channels, 3, stride=2, padding=1)
+        self.conv_p4 = ConvBNSiLU(out_channels * 2, out_channels, 1, padding=0)
+        self.down_p4 = ConvBNSiLU(out_channels, out_channels, 3, stride=2, padding=1)
+        self.conv_p5 = ConvBNSiLU(out_channels + c5, out_channels, 1, padding=0)
 
     def forward(self, s3, s4, s5):
         # Top-down path
@@ -191,7 +191,7 @@ class RMNeck(nn.Module):
 class RMBackbone(nn.Module):
     def __init__(self):
         super().__init__()
-        self.stage1 = ConvBNReLU(3, 16, stride=2)
+        self.stage1 = ConvBNSiLU(3, 16, stride=2)
         self.stage2 = StackedBlocks(16, 32, num_blocks=2, stride=2)   # Stride 4
         self.stage3 = StackedBlocks(32, 64, num_blocks=3, stride=2)   # Stage 3: 步长 8 (416 -> 52x52, 64通道)
         self.stage4 = StackedBlocks(64, 128, num_blocks=3, stride=2)  # Stage 4: 步长 16 (416 -> 26x26, 128通道)
