@@ -339,6 +339,7 @@ def main():
     post_cfg = cfg['train']['post_process']
     cache_loader = cfg['train']['cache_loader']
     continue_cfg = cfg['train']['continue']
+    go_on = False
     
     conf_thresh = float(post_cfg.get('conf_threshold', 0.5))
     kpt_dist_thresh = float(post_cfg.get('kpt_dist_thresh', 15.0))
@@ -373,13 +374,13 @@ def main():
             shutil.rmtree(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
             console.print("[green]已清空历史文件夹，全新开始训练。[/green]")
-            continue_cfg['enabled'] = False  
+            go_on = False  
         elif choice == "3":
             console.print("[bold red]已取消训练任务。[/bold red]")
             return
         else:
             console.print("[green]选择了继续训练，保留现有文件夹。[/green]")
-            continue_cfg['enabled'] = True
+            go_on = True
             if not continue_cfg.get('path'):
                 continue_cfg['path'] = str(save_dir / "last_model.pth")
     else:
@@ -453,14 +454,14 @@ def main():
 
     model = RMDetector(reg_max=reg_max).to(device)
     
-    if continue_cfg['enabled']:
+    if go_on:
         weight_path = Path(continue_cfg['path'])
         if weight_path.exists():
             model.load_state_dict(torch.load(weight_path))
             console.print(f"[bold green]成功加载历史权重：{weight_path}，继续训练。[/bold green]")
         else:
             console.print(f"[bold yellow]警告：指定的历史权重文件 {weight_path} 不存在（可能是新文件夹或已被清除），将自动从头开始训练。[/bold yellow]")
-            continue_cfg['enabled'] = False
+            go_on = False
 
     # 移除了 lambda_conf 和 lambda_box 的传入
     criterion = RMDetLoss(
@@ -610,8 +611,20 @@ def main():
             num_workers=0
         )
         
-        visualize_predictions(model, vis_train_loader, device, save_dir, prefix="train", progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh)
-        visualize_predictions(model, vis_val_loader, device, save_dir, prefix="val", progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh)
+        # 注意：这里把原 train.py 中的 process_multi_scale_dets 作为参数传进去
+        visualize_predictions_with_features(
+            model, vis_train_loader, device, save_dir, prefix="train", 
+            progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, 
+            process_multi_scale_dets_fn=process_multi_scale_dets,  # <-- 传入解码函数
+            num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
+        )
+        
+        visualize_predictions_with_features(
+            model, vis_val_loader, device, save_dir, prefix="val", 
+            progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, 
+            process_multi_scale_dets_fn=process_multi_scale_dets,
+            num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
+        )
 
     console.print(f"\n[bold green]训练与评估完成！所有结果已保存至: {save_dir.absolute()}[/bold green]")
 

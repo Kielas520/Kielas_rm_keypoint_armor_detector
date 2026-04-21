@@ -9,9 +9,9 @@ kielas_rm_train:
 
   augment:
     # --- 基础与光学增强 ---
-    brightness_prob: 0.6        # 适度提高触发概率，应对赛场明暗交替
+    brightness_prob: 0.8        # 适度提高触发概率，应对赛场明暗交替
     brightness_range: [0.5, 2.0]  # 拓宽暗部下限，适应极暗环境
-    blur_prob: 0.4              # 提升运动模糊概率，贴合高速移动特征
+    blur_prob: 0.5              # 提升运动模糊概率，贴合高速移动特征
     blur_ksize: [3, 5, 7]       
     hsv_prob: 0.5               
     hsv_h_gain: 0.015           # 保持极低（关键）：防止红蓝颜色发生反转
@@ -21,18 +21,18 @@ kielas_rm_train:
     bloom_prob: 0.5             # 发光目标对光晕效果非常敏感，提高概率有奇效
     
     # --- 几何变换增强 ---
-    flip_prob: 0.1              # 你的代码已正确处理了4点的左右镜像映射，可直接拉满到0.5
+    flip_prob: 0.0              # 你的代码已正确处理了4点的左右镜像映射，可直接拉满到0.5
     scale_prob: 0.5             
-    scale_range: [0.7, 1.3]     # 稍微扩大缩放范围，模拟更广的远近距离跨度
-    rotate_prob: 0.5            
+    scale_range: [0.5, 1.7]     # 稍微扩大缩放范围，模拟更广的远近距离跨度
+    rotate_prob: 0.7            
     rotate_range: [-25, 25]     # 增加倾斜角度，适应更极限的车体姿态
-    translate_prob: 0.4         
-    translate_range: 0.1        
-    perspective_prob: 0.4       # 提高透视形变概率，实战中大多是斜向视角
-    perspective_factor: 0.08    # 稍微增加形变的剧烈程度
+    translate_prob: 0.6         
+    translate_range: 0.3        
+    perspective_prob: 0.6       # 提高透视形变概率，实战中大多是斜向视角
+    perspective_factor: 0.2    # 稍微增加形变的剧烈程度
 
     # --- 背景替换增强 ---
-    bg_replace_prob: 0.3        # 适当提高以降低对特定场地背景的过拟合
+    bg_replace_prob: 0.5        # 适当提高以降低对特定场地背景的过拟合
     bg_dir: "./background"      
     bg_radius_factor: 1.3       # 从1.5收紧到1.3，避免截取时带入过多原图的背景像素
     
@@ -47,7 +47,7 @@ kielas_rm_train:
   train:
     device: "cuda"              # 可选: "auto", "cuda", "cpu"
     batch_size: 64
-    epochs: 300
+    epochs: 3
     weight_decay: 0.01        # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
     input_size: [416, 416]
@@ -55,7 +55,6 @@ kielas_rm_train:
     reg_max: 16                 # <--- 新增：关键点分布偏移网格范围参数 (预测范围)，决定了网络有没有能力**“够得着”**占据大画幅的近距离装甲板角
 
     continue:
-      enabled: false
       path: "./model_res/best_model.pth"
 
     cache_loader:
@@ -90,8 +89,6 @@ kielas_rm_train:
 
     # --- 损失函数权重 ---
     loss:
-      lambda_conf: 2.0
-      lambda_box: 2.5
       lambda_pose: 5.0
       lambda_cls: 4.0   # 新增分类损失的权重
       alpha: 0.25
@@ -105,8 +102,8 @@ kielas_rm_train:
     
     # 新增：综合评估得分权重配置
     metric_weights:
-      pck: 0.7        # PCK 占总分的权重
-      id_acc: 0.3     # 类别 ID 准确率占总分的权重
+      pck: 0.55        # PCK 占总分的权重
+      id_acc: 0.45     # 类别 ID 准确率占总分的权重
 
     # --- 新增：提前停止机制 ---
     early_stopping:
