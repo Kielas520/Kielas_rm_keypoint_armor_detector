@@ -349,10 +349,13 @@ def process_data(img, labels, cfg, bg_paths: list = None):
                 lab['vis'] = 0
 
     return aug_img, aug_labels
-
 # ================= 测试代码 =================
 if __name__ == "__main__":
     import yaml
+    from rich.progress import track   # <--- 新增进度条导入
+    from rich.console import Console  # <--- 新增终端输出导入
+
+    console = Console()
 
     def parse_labels_for_test(label_path):
         parsed = []
@@ -380,16 +383,15 @@ if __name__ == "__main__":
                             if isinstance(v, list) and len(v) == 2 and k != 'blur_ksize':
                                 v = tuple(v)
                             setattr(cfg, k, v)
-                print(f"✅ 已成功从 {yaml_path} 加载参数。")
+                console.print(f"[green]✅ 已成功从 {yaml_path} 加载参数。[/green]")
             except Exception as e:
-                print(f"❌ 读取 config.yaml 失败: {e}")
+                console.print(f"[red]❌ 读取 config.yaml 失败: {e}[/red]")
     
     bg_dir = Path(cfg.bg_dir)
     bg_paths = list(bg_dir.glob("*.jpg")) + list(bg_dir.glob("*.png")) if bg_dir.exists() else []
     
-    # 删除了测试环境的提前读入逻辑，恢复传背景图路径列表
     if not bg_paths:
-        print("⚠️  警告：未找到背景图片！已自动启用紫绿网格作为测试替代背景。")
+        console.print("[yellow]⚠️  警告：未找到背景图片！已自动启用紫绿网格作为测试替代背景。[/yellow]")
 
     # 1. 强制所有变换发生
     cfg.blur_prob = 1.0
@@ -404,7 +406,7 @@ if __name__ == "__main__":
     cfg.bg_replace_prob = 1.0
     cfg.occ_prob = 1.0
     
-    # 2. 【关键】限制测试时的亮度，避免画面死黑导致完全看不出效果
+    # 2. 限制测试时的亮度，避免画面死黑导致完全看不出效果
     cfg.brightness_prob = 1.0
     cfg.brightness_range = (0.8, 1.5)  
 
@@ -417,7 +419,7 @@ if __name__ == "__main__":
     out_dir = Path("./data/test/augment")
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"提取了 {len(test_samples)} 张图片准备测试极限综合增强...")
+    console.print(f"[bold cyan]提取了 {len(test_samples)} 张图片准备测试极限综合增强...[/bold cyan]")
     
     for i, img_path in enumerate(test_samples):
         img = cv2.imread(str(img_path))
@@ -427,8 +429,8 @@ if __name__ == "__main__":
         if label_path.exists():
             labels = parse_labels_for_test(label_path)
             
-        for v in range(30):
-            # ✅ 这里恢复传入 bg_paths
+        # ✅ 给每张图片的 30 次随机增强循环套上 track 进度条
+        for v in track(range(30), description=f"[cyan]处理样本 {img_path.stem} ({i+1}/{len(test_samples)})[/cyan]", console=console):
             aug_img, aug_lbls = process_data(img, labels, cfg, bg_paths)
             viz_img = aug_img.copy()
             for lbl in aug_lbls:
@@ -439,4 +441,4 @@ if __name__ == "__main__":
             out_path = out_dir / f"test_{img_path.stem}_v{v}.jpg"
             cv2.imwrite(str(out_path), viz_img)
             
-    print(f"测试完毕，输出文件已保存至 {out_dir}")
+    console.print(f"[bold green]✅ 测试完毕，输出文件已保存至 {out_dir}[/bold green]")

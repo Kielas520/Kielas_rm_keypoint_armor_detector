@@ -1,4 +1,3 @@
-from regex import T
 import yaml
 import torch
 import torch.optim as optim
@@ -8,13 +7,19 @@ import torchvision
 import multiprocessing
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
-# 强制关闭 OpenCV 内部多线程与 OpenCL，防止多进程数据加载时 CPU 和内存跑满
+# =========================================================================
+# 【系统级优化】
+# 强制关闭 OpenCV 内部多线程与 OpenCL。
+# 原因：PyTorch 的 DataLoader 多进程 (num_workers > 0) 会和 OpenCV 的内置多线程严重冲突，
+# 导致 CPU 线程数爆炸，资源互相锁死，表现为内存爆满、CPU 100% 但训练极度卡顿。
+# =========================================================================
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False) 
 
 from rich.console import Console
 from rich.prompt import Confirm, Prompt  
-from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+# 引入 rich 进度条的高级组件，包括 SpinnerColumn (转圈动画) 用于指示后台正在增强数据
+from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, SpinnerColumn
 import matplotlib
 matplotlib.use('Agg')  
 import matplotlib.pyplot as plt
@@ -23,7 +28,7 @@ from pathlib import Path
 import shutil
 import gc
 
-# 导入模块
+# 导入自定义模块
 from src.training.src import *
 
 console = Console()
@@ -41,7 +46,7 @@ def plot_and_save_curve(data, epochs, title, ylabel, save_path, color='b'):
     plt.close()
 
 def save_training_curves(history, save_dir):
-    """像 YOLO 一样分别保存多种指标曲线"""
+    """像 YOLO 一样分别保存多种指标曲线，方便直观分析模型收敛情况"""
     epochs = range(1, len(history['val_pck']) + 1)
     
     # 单独保存各项 Loss 和 指标
@@ -52,7 +57,12 @@ def save_training_curves(history, save_dir):
     # 验证集评估指标 PCK 单独保存
     plot_and_save_curve(history['val_pck'], epochs, 'Validation PCK@0.5', 'PCK', save_dir / "val_pck.png", 'r')
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress, scaler):
+
+def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress, scaler, current_stage):
+    """
+    单轮训练逻辑
+    :param current_stage: 接收外部传入的“当前洗牌阶段”，用于显示在进度条上
+    """
     model.train()
     
     # 初始化记录各项 Loss 的字典
@@ -62,8 +72,12 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
         'total_loss': 0.0
     }
     
-    task_id = progress.add_task(f"[cyan]Train Epoch {epoch}", total=len(dataloader))
-    
+    # ✅ 修复：不使用 task.fields，直接将 Stage 拼接到描述字符串中
+    task_id = progress.add_task(
+        f"[cyan]Train Epoch {epoch} [bold magenta](Stage {current_stage})[/bold magenta]", 
+        total=len(dataloader)
+    )
+
     for batch_idx, (imgs, targets, class_ids) in enumerate(dataloader):
         imgs = imgs.to(device)
         targets = [t.to(device) for t in targets]
@@ -71,31 +85,34 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
         
         optimizer.zero_grad()
         
-        # 开启自动混合精度 (AMP) - 前向传播
+        # 开启自动混合精度 (AMP)，极大加速运算并节省显存
         with torch.autocast(device_type=device.type, dtype=torch.float16):
             preds = model(imgs) 
             loss, loss_dict = criterion(preds, targets, class_ids)
             
-        # 使用 scaler 放大 loss 并进行反向传播
+        # 梯度缩放器用于防止 float16 模式下的梯度下溢
         scaler.scale(loss).backward()
-        
-        # 在进行梯度裁剪前，必须先 unscale 梯度
         scaler.unscale_(optimizer)
+        
+        # 梯度裁剪，防止 Loss 爆炸
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0) 
         
-        # 使用 scaler 更新权重
         scaler.step(optimizer)
         scaler.update()
         
-        # 累加各项 Loss
         for k in epoch_losses:
             epoch_losses[k] += loss_dict[k]
             
-        progress.update(task_id, advance=1, description=f"[cyan]Train Epoch {epoch} | Total Loss: {loss.item():.4f} | Cls Loss: {loss_dict['loss_cls']:.4f}")
+        # ✅ 动态更新时，也是直接刷新描述文字
+        progress.update(
+            task_id, 
+            advance=1, 
+            description=f"[cyan]Epoch {epoch} [Stage {current_stage}] | Loss: {loss.item():.3f} | Cls: {loss_dict['loss_cls']:.3f}"
+        )
         
     progress.remove_task(task_id)
     
-    # 取该 Epoch 各项 Loss 的平均值
+    # 计算全 Epoch 平均 Loss
     num_batches = len(dataloader)
     for k in epoch_losses:
         epoch_losses[k] /= num_batches
@@ -118,8 +135,8 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
         if len(gt_dets) == 0:
             continue
             
-        total_kpts += len(gt_dets) * 4 # 每个装甲板4个点
-        total_gts += len(gt_dets)      # 统计目标个数
+        total_kpts += len(gt_dets) * 4 
+        total_gts += len(gt_dets)      
         
         if len(pred_dets) == 0:
             continue
@@ -159,11 +176,11 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
     return correct_kpts, total_kpts, correct_ids, total_gts
 
 def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh):
+    """处理并合并多尺度预测结果，执行 NMS"""
     batch_size = preds[0].size(0)
     gt_dets_batch = [[] for _ in range(batch_size)]
     pred_dets_batch = [[] for _ in range(batch_size)]
     
-    # 1. 逐个尺度解码
     for i, s in enumerate(strides):
         current_grid = (input_size[0] // s, input_size[1] // s)
         
@@ -179,7 +196,6 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
     final_gt_dets = []
     final_pred_dets = []
     
-    # 2. 拼接结果并执行跨尺度 NMS
     for b in range(batch_size):
         if len(gt_dets_batch[b]) > 0:
             merged_gts = np.concatenate(gt_dets_batch[b], axis=0)
@@ -210,6 +226,7 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
 
 @torch.no_grad()
 def validate(model, dataloader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg):
+    """验证集评估，注意验证集绝对不使用任何在线数据增强，以保证测试基准的绝对公平"""
     model.eval()
     total_loss = 0.0
     total_correct_kpts = 0
@@ -217,8 +234,9 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
     total_correct_ids = 0 
     total_gts = 0         
     
+    # ✅ 验证集任务也只使用基本字符串，避免全局字段缺失
     task_id = progress.add_task(f"[magenta]Val Epoch {epoch}", total=len(dataloader))
-    
+
     for imgs, targets, class_ids in dataloader:
         imgs = imgs.to(device)
         targets = [t.to(device) for t in targets]
@@ -231,8 +249,8 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
         total_loss += loss.item()
         
         gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh)
-        
         correct_k, total_k, correct_id, total_gt = calculate_pck(gt_dets, pred_dets, pck_cfg)
+        
         total_correct_kpts += correct_k
         total_kpts += total_k
         total_correct_ids += correct_id
@@ -250,6 +268,7 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
 
 @torch.no_grad()
 def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, strides, reg_max, num_samples=5, conf_threshold=0.5, kpt_dist_thresh=14.5):
+    """输出可视化效果图，便于人工检验模型识别精度"""
     model.eval()
     count = 0
     task_id = progress.add_task(f"[yellow]导出 {prefix} 图像...", total=num_samples)
@@ -273,6 +292,7 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
             fig, ax = plt.subplots(1, figsize=(10, 8))
             ax.imshow(img_np)
             
+            # 画真实框 (GT) - 绿色
             if len(gt_dets[i]) > 0:
                 for det in gt_dets[i]:
                     cls_id = int(det[1])
@@ -290,6 +310,7 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
                                 arrowprops=dict(arrowstyle="-", color='lime', alpha=0.7),
                                 bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="lime", alpha=0.6))
             
+            # 画预测框 (Pred) - 红色虚线
             if len(pred_dets[i]) > 0:
                 for det in pred_dets[i]:
                     score = det[0]
@@ -325,12 +346,16 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
             count += 1
             progress.update(task_id, advance=1)
 
+# =========================================================================
+# 【主函数与训练大循环】
+# =========================================================================
 def main():
     config_file = Path("./config.yaml")
     if not config_file.exists():
         console.print(f"[bold red]错误：找不到配置文件 {config_file}[/bold red]")
         return
 
+    # 加载配置
     with open(config_file, 'r', encoding='utf-8') as f:
         cfg_data = yaml.safe_load(f)
         cfg = cfg_data['kielas_rm_train']
@@ -343,7 +368,7 @@ def main():
     continue_cfg = train_cfg['continue']
     go_on = False
     
-    # 提取半在线洗牌的时钟周期，默认 5 轮洗牌一次
+    # 获取洗牌周期
     shuffle_interval = train_cfg.get('shuffle_interval', 5)
     
     conf_thresh = float(post_cfg.get('conf_threshold', 0.5))
@@ -362,6 +387,7 @@ def main():
     
     scale_ranges = data_cfg.get('scale_ranges', [[0, 64], [32, 128], [96, 9999]])
     
+    # 权重保存目录安全检查
     if save_dir.exists() and any(save_dir.iterdir()):
         choice = Prompt.ask(
             f"\n[bold yellow]输出文件夹 '{save_dir}' 已存在且非空，请选择操作：[/bold yellow]\n"
@@ -416,13 +442,14 @@ def main():
     aug_cfg = AugmentConfig(**aug_cfg_dict)
     
     bg_dir = Path(aug_cfg_dict.get('bg_dir', './background'))
-    bg_paths = list(bg_dir.glob("*.jpg")) + list(bg_dir.glob("*.png")) if bg_dir.exists() else []
+    bg_dir_str = str(aug_cfg_dict.get('bg_dir', './background'))
     
-    # 初始化多进程共享的阶段变量，用于控制子进程同步洗牌
+    # ✅ 创建多进程安全共享变量：充当洗牌时钟
     shared_stage = multiprocessing.Value('i', 0)
     
     console.print(f"[bold cyan]准备数据集 (多进程 Worker={workers})...[/bold cyan]")
 
+    # 训练集：挂载增强引擎、背景库、洗牌时钟
     train_loader = DataLoader(
         RMArmorDataset(
             data_cfg['train_img_dir'], 
@@ -432,19 +459,20 @@ def main():
             strides=strides,
             scale_ranges=scale_ranges, 
             data_name='train',
-            augment_cfg=aug_cfg,          # 注入增强配置
-            bg_paths=bg_paths,            # 注入背景库
-            shared_stage=shared_stage     # 注入同步洗牌时钟
+            augment_cfg=aug_cfg,          
+            bg_dir=bg_dir_str,           # <-- 改为直接传路径字符串
+            shared_stage=shared_stage     
         ),
         batch_size=train_cfg['batch_size'],
         shuffle=True,
         num_workers=workers,
         pin_memory=pin_mem,
         persistent_workers=True if workers > 0 else False,
-        # 👇 新增这一行：让每个 worker 在后台提前准备 4 到 8 个 batch
-        prefetch_factor=train_cfg['prefetch_factor'] if workers > 0 else None
+        # ✅ 使用 prefetch_factor 缓解 CPU 到 GPU 的数据饥饿，保持管线顺畅
+        prefetch_factor=train_cfg.get('prefetch_factor', 4) if workers > 0 else None
     )
     
+    # 验证集：绝对纯净，不包含任何增强
     val_loader = DataLoader(
         RMArmorDataset(
             data_cfg['val_img_dir'], 
@@ -454,7 +482,6 @@ def main():
             strides=strides,
             scale_ranges=scale_ranges, 
             data_name='val'
-            # 验证集不传入 aug_cfg 和 shared_stage，保持绝对的静态测试环境
         ),
         batch_size=train_cfg['batch_size'], 
         shuffle=False, 
@@ -474,10 +501,9 @@ def main():
             console.print(f"[bold yellow]警告：指定的历史权重文件 {weight_path} 不存在（可能是新文件夹或已被清除），将自动从头开始训练。[/bold yellow]")
             go_on = False
 
-    # 解析 dataset.yaml 获取多类别权重
+    # 解析 dataset.yaml 里的分类权重对抗类别不平衡
     train_img_path = Path(data_cfg['train_img_dir'])
     dataset_yaml_path = train_img_path.parent.parent / "dataset.yaml"
-    
     class_weights_tensor = None
     
     if dataset_yaml_path.exists():
@@ -519,39 +545,58 @@ def main():
 
     warmup_epochs = max(1, int(epochs * 0.05))
     scheduler_cfg = train_cfg['scheduler']
-
-    scheduler = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=scheduler_cfg['T_0'],
-        T_mult=scheduler_cfg['T_mult'],
-        eta_min=1e-6
-    )
-
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=scheduler_cfg['T_0'], T_mult=scheduler_cfg['T_mult'], eta_min=1e-6)
     best_val_score = 0.0     
 
     console.print("[bold green]开始训练...[/bold green]")
     
+    # =========================================================================
+    # 【进度条高级定制区】
+    # =========================================================================
     with Progress(
-        TextColumn("[progress.description]{task.description}"),
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"), 
         BarColumn(),
         TaskProgressColumn(),
         TimeRemainingColumn(),
         console=console
     ) as progress:
         
-        epoch_task = progress.add_task("[bold green]总体训练进度", total=epochs)
+        # 将描述改为直观的倒计时
+        epoch_task = progress.add_task(
+            f"[bold green]Overall Training | Stage 0 | Next Shuffle: {shuffle_interval} epochs", 
+            total=epochs
+        )
         
         for epoch in range(1, epochs + 1):
             
-            # 触发洗牌时钟：跳过第一轮，后续按照设定的间隔轮数同步阶段
+            # ✅ 洗牌触发器
             if epoch > 1 and (epoch - 1) % shuffle_interval == 0:
                 with shared_stage.get_lock():
                     shared_stage.value += 1
-                console.print(f"\n[bold yellow]🔄 触发半在线洗牌机制！目前进入增强数据批次 {shared_stage.value}[/bold yellow]")
+                console.print(f"\n[bold yellow]🔄 触发半在线洗牌机制！背景图与增强数据已重载，目前进入 Stage {shared_stage.value}[/bold yellow]")
             
-            epoch_losses = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress, scaler)
-            val_loss, val_pck, val_id_acc = validate(model, val_loader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg)
+            # 计算距离下次洗牌还有几轮
+            next_shuffle_in = shuffle_interval - ((epoch - 1) % shuffle_interval)
             
+            # 实时更新总进度条上的文本显示
+            progress.update(
+                epoch_task, 
+                description=f"[bold green]Overall Training | Stage {shared_stage.value} | Next Shuffle: {next_shuffle_in} epochs"
+            )
+            
+            # 将 shared_stage.value 传进 train_one_epoch
+            epoch_losses = train_one_epoch(
+                model, train_loader, optimizer, criterion, device, 
+                epoch, progress, scaler, shared_stage.value
+            )
+            
+            val_loss, val_pck, val_id_acc = validate(
+                model, val_loader, criterion, device, epoch, progress, 
+                input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg
+            )
+            
+            # 学习率预热及调节
             if epoch <= warmup_epochs:
                 current_lr = base_lr * (epoch / warmup_epochs)
                 for param_group in optimizer.param_groups:
@@ -562,15 +607,16 @@ def main():
 
             val_score = (w_pck * val_pck) + (w_id * val_id_acc)
 
+            # 存储曲线
             history['train_total'].append(epoch_losses['total_loss'])
             history['train_pose'].append(epoch_losses['loss_pose'])
             history['train_cls'].append(epoch_losses['loss_cls'])
-            
             history['val_pck'].append(val_pck)
             history['val_id_acc'].append(val_id_acc)
             history['val_score'].append(val_score)
             history['lr'].append(current_lr)
             
+            # 打印本轮日志
             console.print(
                 f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | "
                 f"Train Total: {epoch_losses['total_loss']:.4f} | "
@@ -584,6 +630,7 @@ def main():
                 f"Val Score: {val_score:.4f}"
             )
             
+            # 保存最佳权重
             if val_score > best_val_score:
                 best_val_score = val_score
                 torch.save(model.state_dict(), save_dir / "best_model.pth")
@@ -591,12 +638,13 @@ def main():
             
             progress.update(epoch_task, advance=1)
             
+            # 早停判定
             if auto_stop_enabled and val_score >= min_score:
                 console.print(f"\n[bold yellow]验证集综合得分 ({val_score:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
                 break
 
+        # 保存最后一轮权重与日志图表
         torch.save(model.state_dict(), save_dir / "last_model.pth")
-        
         save_training_curves(history, save_dir)
         
         log_file = save_dir / "train_log.txt"
@@ -606,6 +654,7 @@ def main():
                 f.write(f"{i+1}\t{history['lr'][i]:.6f}\t{history['train_total'][i]:.6f}\t"
                         f"{history['train_pose'][i]:.6f}\t{history['train_cls'][i]:.6f}\t{history['val_pck'][i]:.6f}\n")
                 
+        # 主动释放内存，准备后续的可视化
         del train_loader
         del val_loader
         gc.collect()
@@ -619,38 +668,20 @@ def main():
             console.print("[yellow]警告：未发现最佳模型文件，将使用最后一次迭代的权重进行可视化。[/yellow]")
             model.load_state_dict(torch.load(save_dir / "last_model.pth", weights_only=True))
         
-        # 可视化阶段全部保持无增强环境，直观评估原图表现
         vis_train_dataset = RMArmorDataset(
-            data_cfg['train_img_dir'], 
-            data_cfg['train_label_dir'],
-            data_cfg['class_id'],
-            input_size=input_size, 
-            strides=strides, 
-            data_name='vis_train'
+            data_cfg['train_img_dir'], data_cfg['train_label_dir'], data_cfg['class_id'],
+            input_size=input_size, strides=strides, data_name='vis_train'
         )
         
         vis_val_dataset = RMArmorDataset(
-            data_cfg['val_img_dir'], 
-            data_cfg['val_label_dir'],
-            data_cfg['class_id'],
-            input_size=input_size, 
-            strides=strides, 
-            data_name='vis_val'
+            data_cfg['val_img_dir'], data_cfg['val_label_dir'], data_cfg['class_id'],
+            input_size=input_size, strides=strides, data_name='vis_val'
         )
 
-        vis_train_loader = DataLoader(
-            vis_train_dataset, 
-            batch_size=1, 
-            shuffle=True, 
-            num_workers=0
-        )
-        vis_val_loader = DataLoader(
-            vis_val_dataset, 
-            batch_size=1, 
-            shuffle=True, 
-            num_workers=0
-        )
+        vis_train_loader = DataLoader(vis_train_dataset, batch_size=1, shuffle=True, num_workers=0)
+        vis_val_loader = DataLoader(vis_val_dataset, batch_size=1, shuffle=True, num_workers=0)
         
+        # 兼容两种可视化函数名
         try:
             visualize_predictions_with_features(
                 model, vis_train_loader, device, save_dir, prefix="train", 
@@ -658,7 +689,6 @@ def main():
                 process_multi_scale_dets_fn=process_multi_scale_dets,
                 num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
             )
-            
             visualize_predictions_with_features(
                 model, vis_val_loader, device, save_dir, prefix="val", 
                 progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, 
@@ -666,7 +696,6 @@ def main():
                 num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
             )
         except NameError:
-            # 向后兼容你之前代码中用到的函数名
             visualize_predictions(
                 model, vis_train_loader, device, save_dir, prefix="train", 
                 progress=progress, input_size=input_size, strides=strides, reg_max=reg_max,

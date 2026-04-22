@@ -50,7 +50,7 @@ kielas_rm_train:
   train:
     device: "cuda"              # 可选: "auto", "cuda", "cpu"
     batch_size: 128
-    prefetch_factor: 8
+    prefetch_factor: 8            # 预取 批次 ，决定每次从硬盘读取多少数据
     epochs: 10
     weight_decay: 0.01        # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
@@ -147,7 +147,7 @@ kielas_rm_export:
 
 kielas_rm_demo:
   # 相机类型可选: "usb" (标准UVC相机), "hik" (海康工业相机)
-  camera_type: "hik" 
+  camera_type: "usb" 
   # 相机索引或视频文件路径
   camera_index: 0
   

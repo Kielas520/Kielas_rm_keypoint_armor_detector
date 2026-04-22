@@ -1,4 +1,5 @@
 import os
+from os import path
 import cv2
 import torch
 import numpy as np
@@ -8,7 +9,7 @@ from torch.utils.data import Dataset
 from rich.console import Console  
 # 顶部引入 track
 from rich.progress import track
-
+from pathlib import Path
 console = Console()  
 
 # --- 关闭 OpenCV 内部多线程与 OpenCL ---
@@ -83,7 +84,7 @@ def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52)
 class RMArmorDataset(Dataset):
     def __init__(self, img_dir, label_dir, class_id, input_size=(416, 416), strides=[8, 16, 32], 
                  scale_ranges=[[0, 64], [32, 128], [96, 9999]], transform=None, data_name='', 
-                 augment_cfg=None, bg_paths=None, shared_stage=None):
+                 augment_cfg=None, bg_dir=None, shared_stage=None): # <-- 改为 bg_dir
         
         self.img_dir = img_dir
         self.label_dir = label_dir
@@ -97,18 +98,14 @@ class RMArmorDataset(Dataset):
         self.grid_sizes = [(input_size[0] // s, input_size[1] // s) for s in strides]
         
         self.samples = [f.split('.')[0] for f in os.listdir(label_dir) if f.endswith('.txt')]
-        
-        # 半在线洗牌时钟 (来自 train.py 的 multiprocessing.Value)
         self.shared_stage = shared_stage
-        
-        # 增强配置
+        # self.processed_counter = processed_counter # <-- 接收跨进程计数器
         self.augment_cfg = augment_cfg
         
-        # 只保存路径列表，利用系统底层缓存动态读取，拒绝内存爆炸！
-        self.bg_paths = bg_paths
-        
-        if self.bg_paths:
-            console.print(f"✅ {data_name} 数据集已链接 {len(self.bg_paths)} 张背景图路径。")
+        # 仅保存目录路径，不提前搬运数据
+        self.bg_dir = bg_dir
+        self.bg_paths = None
+        self.current_worker_stage = -1 # 用于记录当前 Worker 的洗牌状态
 
     def __len__(self):
         return len(self.samples)
@@ -118,7 +115,6 @@ class RMArmorDataset(Dataset):
         
         # ================= 1. 读取原始图像与标签 =================
         img_path = os.path.join(self.img_dir, f"{sample_name}.jpg")
-        # 统一读取为 BGR 格式，方便进行 HSV 变换等传统色彩空间增强
         img = cv2.imread(img_path) 
         
         label_path = os.path.join(self.label_dir, f"{sample_name}.txt")
@@ -129,34 +125,31 @@ class RMArmorDataset(Dataset):
         for line in lines:
             line = line.strip()
             if not line: continue
-
             parts = line.split(']')[-1].strip().split()
             data = [float(x) for x in parts]
-            
             cls_id = int(data[0])
             
-            # 兼容 9 维（无可见度）和 10 维（有可见度）的原始标签
             if len(data) == 9:
-                vis = 2  # 强制补齐默认可见度 2
+                vis = 2
                 pts = np.array(data[1:9], dtype=np.float32).reshape(4, 2)
             else:
                 vis = int(data[1])
                 pts = np.array(data[2:10], dtype=np.float32).reshape(4, 2)
                 
-            parsed_labels.append({
-                'class_id': cls_id,
-                'vis': vis,
-                'pts': pts
-            })
+            parsed_labels.append({'class_id': cls_id, 'vis': vis, 'pts': pts})
 
-        # ================= 2. 半在线随机洗牌机制 =================
+        # ================= 2. 半在线随机洗牌机制 & 动态读图 =================
         current_stage = self.shared_stage.value if self.shared_stage is not None else 0
         
-        # 使用 hashlib 生成绝对稳定的 MD5，避免多进程环境下的内置 hash() 随机盐差异
+        # 【核心逻辑】如果发生洗牌 (Stage 变化) 或初次加载，Worker 才会去扫描一次背景图文件夹
+        # 这样如果在训练期间向 background 文件夹塞了新图，下次洗牌时也会被自动包含进去
+        if self.bg_dir and (self.bg_paths is None or self.current_worker_stage != current_stage):
+            bg_path_obj = Path(self.bg_dir)
+            self.bg_paths = list(bg_path_obj.glob("*.jpg")) + list(bg_path_obj.glob("*.png")) if bg_path_obj.exists() else []
+            self.current_worker_stage = current_stage
+
         md5_hash = hashlib.md5(sample_name.encode('utf-8')).hexdigest()
         base_seed = int(md5_hash, 16)
-        
-        # 强制约束在 NumPy 允许的无符号 32 位整数范围内 (0 ~ 4294967295)
         seed = (base_seed + current_stage * 100000) % (2**32)
         
         random.seed(seed)
@@ -164,7 +157,7 @@ class RMArmorDataset(Dataset):
 
         # ================= 3. 呼叫增强黑盒 =================
         if self.augment_cfg is not None:
-            # ✅ 把传入的 self.bg_imgs 改回 self.bg_paths
+            # 直接传入当前 Worker 的 self.bg_paths
             aug_img, aug_labels = process_data(img, parsed_labels, self.augment_cfg, self.bg_paths)
         else:
             aug_img, aug_labels = img, parsed_labels
