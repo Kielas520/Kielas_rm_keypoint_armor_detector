@@ -18,9 +18,6 @@ def export_onnx(model, dummy_input, output_path: Path, cfg):
     opset_version = cfg['onnx'].get('opset', 18)
     
     with Status("[bold yellow]正在导出原生 ONNX 模型 (Legacy TorchScript 引擎)...", console=console):
-        # 核心修复点：
-        # 1. 传入原始 model，不使用 torch.jit.trace
-        # 2. 显式追加 dynamo=False 参数，强制规避 PyTorch 2.5+ 不稳定的底层引擎
         torch.onnx.export(
             model,
             dummy_input,
@@ -29,7 +26,6 @@ def export_onnx(model, dummy_input, output_path: Path, cfg):
             opset_version=opset_version,
             do_constant_folding=True,
             input_names=['input'],
-            # --- 修改点 1: 适配多尺度，提供 3 个输出节点名称 ---
             output_names=['output_p3', 'output_p4', 'output_p5'], 
             dynamo=False
         )
@@ -50,7 +46,6 @@ def export_onnx(model, dummy_input, output_path: Path, cfg):
                     console.print("[-] [bold red]ONNX 轻量化校验失败，保留初始版本。[/bold red]")
         except ImportError:
             console.print("[-] [bold red]未检测到 onnx 或 onnxsim 库，跳过极致轻量化步骤。[/bold red]")
-            console.print("    建议执行: [white]pip install onnx onnxsim[/white]")
     else:
         console.print(f"[+] [bold green]ONNX 导出完成（按配置跳过轻量化）[/bold green]，文件已保存至: [cyan]{output_path}[/cyan]")
 
@@ -82,9 +77,9 @@ def main():
     formats = cfg.get('formats', [])
     input_size = cfg.get('input_size', [416, 416])
     
-    # --- 修改点 2: 读取 reg_max 与 num_classes ---
     reg_max = cfg.get('reg_max', 16)
-    num_classes = cfg.get('num_classes', 12)
+    # 【修正】：类别数默认改为 13
+    num_classes = cfg.get('num_classes', 13)
 
     if not weights_path.exists():
         console.print(f"[bold red]错误：权重文件不存在 {weights_path.absolute()}[/bold red]")
@@ -95,7 +90,7 @@ def main():
     console.print("[*] [bold cyan]正在初始化模型并加载权重...[/bold cyan]")
     device = torch.device('cpu') 
     
-    # --- 修改点 3: 实例化时传入 reg_max 和 num_classes ---
+    # 【修正】：实例化模型时传入 13 类
     model = RMDetector(reg_max=reg_max, num_classes=num_classes)
     model.load_state_dict(torch.load(weights_path, map_location=device))
     

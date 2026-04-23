@@ -7,7 +7,7 @@ kielas_rm_train:
 
   dataset:
     raw_dir: "./data/raw"      # 确保本地有这个目录
-    purify_dir: "./data/purify" # "~/autodl-fs/purify"
+    purify_dir: "~/autodl-fs/purify" # "./data/purify"
     balance_dir: "./data/balance"
     datasets_dir: "./data/datasets"
     balance:
@@ -58,7 +58,7 @@ kielas_rm_train:
     num_classes: 13
     batch_size: 128
     prefetch_factor: 12            # 预取 批次 ，决定每次从硬盘读取多少数据
-    epochs: 3
+    epochs: 200
     weight_decay: 0.01        # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
     input_size: [416, 416]
@@ -69,7 +69,7 @@ kielas_rm_train:
       path: "./model_res/best_model.pth"
 
     # --- 新增：半在线洗牌频率 ---
-    shuffle_interval: 2  # 每 5 轮重新随机生成一次不同的增强数据
+    shuffle_interval: 50  # 每 50 轮重新随机生成一次不同的增强数据
     
     optimizer:
       base_lr: 0.0002
