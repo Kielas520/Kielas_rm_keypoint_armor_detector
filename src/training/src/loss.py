@@ -85,12 +85,14 @@ class Integral(nn.Module):
 
 # 修改 2：RMDetLoss
 class RMDetLoss(nn.Module):
-    def __init__(self, lambda_pose=1.5, lambda_cls=1.0, alpha=0.85, gamma=2.0, reg_max=16, omega=10.0, epsilon=2.0, num_classes=12, class_weights=None):
+    # 修改 1：新增 negative_class_id 参数，默认设为 12 (根据你的 yaml 配置)
+    def __init__(self, lambda_pose=1.5, lambda_cls=1.0, alpha=0.85, gamma=2.0, reg_max=16, omega=10.0, epsilon=2.0, num_classes=12, class_weights=None, negative_class_id=12):
         super().__init__()
         self.lambda_pose = lambda_pose 
         self.lambda_cls = lambda_cls
         self.reg_max = reg_max
         self.num_classes = num_classes
+        self.negative_class_id = negative_class_id
         
         # 新增逻辑：处理传入的 class_weights 并传递给 FocalLoss
         if class_weights is not None:
@@ -104,27 +106,25 @@ class RMDetLoss(nn.Module):
         self.integral = Integral(reg_max)
         self.wing_loss = WingLoss(omega=omega, epsilon=epsilon)
 
-    def compute_single_scale_loss(self, pred, target, target_class, global_num_pos): 
-        # pred shape: [B, num_classes + 8*reg_max, H, W]
-        
-        # 1. 提取分类通道 (同时承担正负样本判别任务)
+    # 修改 2：分离分类归一化(global_num_pos)和位姿归一化(global_num_valid_pose)
+    def compute_single_scale_loss(self, pred, target, target_class, global_num_pos, global_num_valid_pose): 
         pred_cls = pred[:, :self.num_classes, :, :]
         
         # target_conf 依然用于指示该网格是否有目标 (1.0 为有，0.0 为背景)
         target_conf = target[:, 0, :, :]
-        pos_mask = (target_conf == 1.0)
-        
-        # 构建 one-hot 格式的分类 target
-        target_cls_onehot = torch.zeros_like(pred_cls)
         target_class_long = target_class[:, 0:1, :, :].long()
-        # 将对应类别的通道置为 1.0 -> 引入标签平滑，改为 0.9
-        target_cls_onehot.scatter_(1, target_class_long, 0.9)
-        # 将非正样本的网格全部置为 0.0 (背景)
-        target_cls_onehot = target_cls_onehot * pos_mask.unsqueeze(1).float()
         
-        # 计算全局分类损失 (包含正负样本)
+        # conf_mask 依然用于分类损失，所有标注过的物体（包含类别12）都需要参与分类
+        conf_mask = (target_conf == 1.0)
+        
+        # 修改 3：pos_mask 仅保留真正需要回归位姿的类别，剔除负样本类
+        pos_mask = conf_mask & (target_class_long.squeeze(1) != self.negative_class_id)
+        
+        target_cls_onehot = torch.zeros_like(pred_cls)
+        target_cls_onehot.scatter_(1, target_class_long, 0.9)
+        target_cls_onehot = target_cls_onehot * conf_mask.unsqueeze(1).float()
+        
         loss_cls_sum = self.focal_loss(pred_cls, target_cls_onehot)
-        # 【关键修复】：使用全局正样本数量进行归一化
         loss_cls = loss_cls_sum / global_num_pos
 
         if not pos_mask.any():
@@ -134,62 +134,50 @@ class RMDetLoss(nn.Module):
                 'total_loss': (loss_cls * self.lambda_cls).item()
             }
         
-        # 2. 关键点损失 (DFL + L1 + OKS + Structural)
         pose_start_idx = self.num_classes
         pose_end_idx = self.num_classes + 8 * self.reg_max
         
+        # 仅对有效目标（排除纯背景和类别12）提取预测位姿
         pred_pose_raw = pred[:, pose_start_idx:pose_end_idx, :, :].permute(0, 2, 3, 1)[pos_mask]
         pred_pose_dist = pred_pose_raw.view(-1, 8, self.reg_max) 
         
-        # 【注意】：假设 datasets.py 的 target_vector 已经去除了 4 维 box，精简为 9 维 (1 conf + 8 pose)
-        # 因此，这里的坐标切片从 5:13 改为 1:9
         target_pose = target[:, 1:9, :, :].permute(0, 2, 3, 1)[pos_mask]
         
         target_pose_shifted = target_pose + (self.reg_max // 2)
         target_pose_shifted = torch.clamp(target_pose_shifted, 0, self.reg_max - 1.01)
         
-        # 计算 DFL (除以 global_num_pos 和 8个关键点坐标)
+        # 修改 4：所有位姿损失使用 global_num_valid_pose 进行归一化
         loss_pose_dfl_sum = self.dfl(pred_pose_dist, target_pose_shifted)
-        loss_pose_dfl = loss_pose_dfl_sum / (global_num_pos * 8)
+        loss_pose_dfl = loss_pose_dfl_sum / (global_num_valid_pose * 8)
         
         pred_pose_continuous = self.integral(pred_pose_dist) - (self.reg_max // 2)
         
-        # L1 Loss (改为 sum 并全局归一化) -> 替换为 Wing Loss
         loss_pose_l1_sum = self.wing_loss(pred_pose_continuous, target_pose)
-        loss_pose_l1 = loss_pose_l1_sum / (global_num_pos * 8)
+        loss_pose_l1 = loss_pose_l1_sum / (global_num_valid_pose * 8)
         
-        # --- 新增：装甲板刚体几何先验约束 (Structural Loss) ---
         pred_pts = pred_pose_continuous.view(-1, 4, 2)
         target_pts = target_pose.view(-1, 4, 2)
         
-        # 获取预测对角线中点 (0与2为一条对角线, 1与3为另一条)
         pred_diag1_mid = (pred_pts[:, 0, :] + pred_pts[:, 2, :]) / 2.0
         pred_diag2_mid = (pred_pts[:, 1, :] + pred_pts[:, 3, :]) / 2.0
         
-        # 真实框整体几何中心
         target_center = target_pts.mean(dim=1)
         
-        # 惩罚对角线中点与真实中心的距离差异，约束形状不发生严重畸变
         loss_struct_sum = F.smooth_l1_loss(pred_diag1_mid, target_center, reduction='sum') + \
                           F.smooth_l1_loss(pred_diag2_mid, target_center, reduction='sum')
-        loss_struct = loss_struct_sum / (global_num_pos * 4)  # 2个中点各2个坐标维度
-        # ----------------------------------------------------
-
-        # 直接通过真实的 4 个关键点计算当前尺度下的包围框宽和高
+        loss_struct = loss_struct_sum / (global_num_valid_pose * 4)  
+        
         w_grid = target_pts[:, :, 0].max(dim=1)[0] - target_pts[:, :, 0].min(dim=1)[0]
         h_grid = target_pts[:, :, 1].max(dim=1)[0] - target_pts[:, :, 1].min(dim=1)[0]
         
-        # 计算尺度因子 scale 用于 OKS
         scale = w_grid * h_grid + 1e-6
         
         dists_sq = ((pred_pose_continuous - target_pose) ** 2).view(-1, 4, 2).sum(dim=-1)
         oks = torch.exp(-dists_sq / (2 * scale.unsqueeze(1) * 0.05))
         
-        # OKS Loss (改为 sum 并全局归一化)
         loss_oks_sum = (1.0 - oks).sum()
-        loss_oks = loss_oks_sum / global_num_pos
+        loss_oks = loss_oks_sum / global_num_valid_pose
         
-        # 将 Structural Loss 加入总 Pose Loss（给与 0.2 的适中权重，不破坏原有梯度的平稳性）
         loss_pose = loss_pose_dfl + loss_pose_l1 + loss_oks * 0.5 + loss_struct * 0.2
 
         total_loss = (
@@ -213,15 +201,26 @@ class RMDetLoss(nn.Module):
             'total_loss': 0.0
         }
         
-        # 【关键修复】：提前遍历所有尺度，计算全局的正样本数量
         global_num_pos = 0.0
+        global_num_valid_pose = 0.0
+        
+        # 提前遍历尺度：统计分类的正样本基数与姿态回归的有效正样本基数
         for i in range(len(targets)):
-            global_num_pos += (targets[i][:, 0, :, :] == 1.0).sum().float()
+            conf_mask = (targets[i][:, 0, :, :] == 1.0)
+            global_num_pos += conf_mask.sum().float()
+            
+            cls_long = target_classes[i][:, 0, :, :].long()
+            valid_pose_mask = conf_mask & (cls_long.squeeze(1) != self.negative_class_id)
+            global_num_valid_pose += valid_pose_mask.sum().float()
+            
         global_num_pos = torch.clamp(global_num_pos, min=1.0) # type: ignore
+        global_num_valid_pose = torch.clamp(global_num_valid_pose, min=1.0) # type: ignore
         
         num_scales = len(preds)
         for i in range(num_scales):
-            loss_scale, dist_scale = self.compute_single_scale_loss(preds[i], targets[i], target_classes[i], global_num_pos)
+            loss_scale, dist_scale = self.compute_single_scale_loss(
+                preds[i], targets[i], target_classes[i], global_num_pos, global_num_valid_pose
+            )
             
             total_loss += loss_scale
             for k in combined_loss_dict:

@@ -350,6 +350,7 @@ def main():
     
     # 【修复 1】：动态获取总类别数
     num_classes = int(train_cfg.get('num_classes', 13))
+    negative_class_id = int(train_cfg.get('negative_class_id', 12))
     
     shuffle_interval = train_cfg.get('shuffle_interval', 5)
     conf_thresh = float(post_cfg.get('conf_threshold', 0.5))
@@ -494,7 +495,8 @@ def main():
         omega=loss_cfg.get('omega', 10.0),
         epsilon=loss_cfg.get('epsilon', 2.0),
         num_classes=num_classes,
-        class_weights=class_weights_tensor
+        class_weights=class_weights_tensor,
+        negative_class_id=negative_class_id
     ).to(device)
     
     optim_cfg = train_cfg['optimizer']

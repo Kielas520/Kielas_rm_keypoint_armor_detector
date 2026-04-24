@@ -55,6 +55,7 @@ kielas_rm_train:
   train:
     device: "cuda"              # 可选: "auto", "cuda", "cpu"
     num_classes: 13
+    negative_class_id: 12
     batch_size: 128
     prefetch_factor: 12            # 预取 批次 ，决定每次从硬盘读取多少数据
     epochs: 200
@@ -138,6 +139,7 @@ kielas_rm_export:
   # 权重文件路径
   weights: "./model_res/best_model.pth"
   num_classes: 13                 # <--- 【修改】改成 13
+  negative_class_id: 12
   # 导出模型存放目录
   output_dir: "./export_res"
   # 导出格式列表，支持 "onnx", "torchscript"

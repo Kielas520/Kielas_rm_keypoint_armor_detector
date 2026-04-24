@@ -22,6 +22,7 @@ class Detector:
         self.strides = self.cfg.get('strides', [8, 16, 32])
         self.reg_max = self.cfg.get('reg_max', 16)
         self.num_classes = self.cfg.get('num_classes', 13)
+        self.negative_class_id = self.cfg.get('negative_class_id', 12)
         
         self.conf_threshold = self.cfg['conf_threshold']
         self.kpt_dist_thresh = self.cfg.get('kpt_dist_thresh', 15.0)
@@ -66,7 +67,7 @@ class Detector:
             score, cls_id = det[0], int(det[1])
             
             # 【核心修改】：遇到负样本直接跳过，不在画面上绘制
-            if cls_id == 12:
+            if cls_id == self.negative_class_id:
                 continue
                 
             pts = det[2:].reshape(4, 2)
