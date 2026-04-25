@@ -17,19 +17,21 @@ def main():
         cfg = yaml.safe_load(f)
     
     train_cfg = cfg.get('kielas_rm_train', {})
-    dataset_cfg = train_cfg.get('dataset', {})
+    dataset_cfg = train_cfg.get('negative_data', {})
     
     # 获取负样本类别 ID
     neg_class_id = train_cfg.get('train', {}).get('negative_class_id', 12)
     
     # 获取输入路径：这里默认读取 yaml 中的背景图目录，你也可以根据实际情况修改这个键值
-    input_dir_str = dataset_cfg.get('augment', {}).get('bg_dir', './background')
+    input_dir_str = dataset_cfg.get('input_dir', './negative')
     input_dir = Path(input_dir_str)
     
-    # 获取输出根路径：从 dataset 的配置中提取，例如从 "./data/balance" 中提取出 "./data"
+    # 获取输出根路径
     # 如果没找到，默认使用 "./data"
-    balance_dir_str = dataset_cfg.get('balance_dir', './data/balance')
-    output_root = Path(balance_dir_str).parent 
+    output_dir_str = dataset_cfg.get('output_dir', './data/balance')
+    output_root = Path(output_dir_str)
+    # expanduser() 处理 ~，resolve() 处理相对路径并将其转为绝对路径
+    output_root = Path(output_dir_str).expanduser().resolve()
     
     if not input_dir.exists():
         console.print(f"[bold red]错误：输入图库目录 {input_dir} 不存在，请检查！[/bold red]")

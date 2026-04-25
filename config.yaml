@@ -1,5 +1,31 @@
 kielas_rm_train:
+  downloader:
+    type: 'negative'
+    background:
+      url: "http://groups.csail.mit.edu/vision/LabelMe/NewImages/indoorCVPR_09.tar"
+      tar_name: "indoorCVPR_09.tar"
+      limit: 5000
+      max_res: 1280
+      min_res: 320
+      use_proxy: false
+      proxies:
+        http: "http://127.0.0.1:7897"
+        https: "http://127.0.0.1:7897"
+      output_dir: './background'
+    negative:
+      url: "http://groups.csail.mit.edu/vision/LabelMe/NewImages/indoorCVPR_09.tar"
+      tar_name: "indoorCVPR_09.tar"
+      limit: 5000
+      output_dir: "./negative"
+      use_proxy: false
+      proxies:
+        http: "http://127.0.0.1:7897"
+        https: "http://127.0.0.1:7897"
   
+  negative_data:
+    input_dir: './negative'
+    output_dir: "~/autodl-fs/purify"
+
   sampler:
     max_num_classes: 13
     video_path: "D:\\Download\\negative.mp4"
@@ -73,7 +99,7 @@ kielas_rm_train:
       betas: [0.940, 0.999] 
     
     scheduler:
-      T_0: 400                  # 【保持】取消重启机制，直接退火至结束
+      T_0: 500                  # 【保持】取消重启机制，直接退火至结束
       T_mult: 1
     
     post_process:
@@ -110,33 +136,6 @@ kielas_rm_train:
     early_stopping:
       enabled: false        
       min_score: 0.98        
-
-  tools:
-    type: 'negative'
-
-    background:
-      url: "http://groups.csail.mit.edu/vision/LabelMe/NewImages/indoorCVPR_09.tar"
-      tar_name: "indoorCVPR_09.tar"
-      limit: 5000
-      max_res: 1280
-      min_res: 320
-      use_proxy: false
-      proxies:
-        http: "http://127.0.0.1:7897"
-        https: "http://127.0.0.1:7897"
-      output_dir: './background'
-    
-    negative:
-      url: "http://groups.csail.mit.edu/vision/LabelMe/NewImages/indoorCVPR_09.tar"
-      tar_name: "indoorCVPR_09.tar"
-      limit: 5000
-      max_res: 1280
-      min_res: 320
-      use_proxy: false
-      proxies:
-        http: "http://127.0.0.1:7897"
-        https: "http://127.0.0.1:7897"
-      output_dir: './negative'
 
 kielas_rm_export:
   weights: "./model_res/best_model.pth"
