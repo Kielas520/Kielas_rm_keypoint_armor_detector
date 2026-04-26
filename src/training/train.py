@@ -40,7 +40,7 @@ class ModelEMA:
     保持模型权重的滑动平均，能极大程度过滤掉因为激进数据增强带来的 Loss 锯齿波动，
     从而保存下泛化能力最强的稳定权重。
     """
-    def __init__(self, model, decay=0.9999, tau=2000, updates=0):
+    def __init__(self, model, decay=0.99, tau=480, updates=0):
         # 创建一个与原模型结构相同但没有梯度的 EMA 模型
         self.ema = deepcopy(model).eval()
         self.updates = updates
